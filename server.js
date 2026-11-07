@@ -18,8 +18,36 @@ const MB = 1024 * 1024;
 const STD_TG_LIMIT = Math.floor(49.2 * MB);
 
 let cobaltReady = true;
-let localApiReady = Boolean( process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH );
+let localApiReady = Boolean(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH);
 let localApiLastError = '';
+let ytDlpBin = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : '';
+
+// Автоматичне підвантаження yt-dlp_linux у /tmp/yt-dlp, якщо образ зібрано зі старого Dockerfile
+async function ensureYtDlp() {
+  if (ytDlpBin && fs.existsSync(ytDlpBin)) return ytDlpBin;
+  const tmpBin = '/tmp/yt-dlp';
+  if (fs.existsSync(tmpBin)) {
+    ytDlpBin = tmpBin;
+    return ytDlpBin;
+  }
+  try {
+    const r = await fetch('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux', {
+      headers: { 'User-Agent': UA },
+      redirect: 'follow'
+    });
+    if (r.ok && r.body) {
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length > 1000000) {
+        fs.writeFileSync(tmpBin, buf, { mode: 0o755 });
+        ytDlpBin = tmpBin;
+        console.log('[yt-dlp] Standalone binary downloaded to /tmp/yt-dlp');
+      }
+    }
+  } catch (e) {
+    console.warn('[yt-dlp] Auto-download skipped:', e.message);
+  }
+  return ytDlpBin;
+}
 
 // Очищення та перевірка TELEGRAM_API_ID і TELEGRAM_API_HASH
 const RAW_API_ID = String(process.env.TELEGRAM_API_ID || '').replace(/['"\s]+/g, '');
@@ -84,9 +112,6 @@ function startLocalBotApi() {
     return;
   }
 
-  // КРИТИЧНО: На Render /tmp монтується як чистий tmpfs під час старту контейнера,
-  // тому обов'язково створюємо /tmp/tgbotapi та /tmp/tgbotapi-tmp у рантаймі перед запуском бінарника
-  // (інакше td::realpath() у telegram-bot-api падає з помилкою No such file or directory та кодом 1!)
   try {
     fs.mkdirSync('/tmp/tgbotapi', { recursive: true, mode: 0o755 });
     fs.mkdirSync('/tmp/tgbotapi-tmp', { recursive: true, mode: 0o755 });
@@ -161,6 +186,48 @@ function runFfmpeg(args, timeoutMs = 120000) {
       clearTimeout(timer);
       if (code === 0) resolve(true);
       else reject(new Error('ffmpeg exit ' + code + ': ' + errOut.slice(-300)));
+    });
+  });
+}
+
+function runYtDlpToFile(sourceUrl, outPath, quality = '1080', dubLang = '', isAudio = false, timeoutMs = 45000) {
+  return new Promise((resolve, reject) => {
+    if (!ytDlpBin || !fs.existsSync(ytDlpBin)) return reject(new Error('NO_YTDLP'));
+    const qNum = Math.min(1080, Number(quality === 'max' ? 1080 : quality) || 720);
+    const dub = dubLang && dubLang !== 'orig' ? String(dubLang).split(/[-_]/)[0].toLowerCase() : '';
+    let fmt = '';
+    if (isAudio) {
+      fmt = dub ? `bestaudio[language^=${dub}]/bestaudio/best` : 'bestaudio/best';
+    } else if (dub) {
+      fmt = `bestvideo[height<=${qNum}][ext=mp4]+bestaudio[language^=${dub}]/bestvideo[height<=${qNum}]+bestaudio[language^=${dub}]/bestvideo[height<=${qNum}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${qNum}]/best`;
+    } else {
+      fmt = `bestvideo[height<=${qNum}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${qNum}][ext=mp4]/best[height<=${qNum}]/best`;
+    }
+    const args = [
+      '--no-playlist',
+      '--no-warnings',
+      '--geo-bypass',
+      '--extractor-args', 'youtube:player_client=ios,android_vr,tv_embedded',
+      '-f', fmt,
+      ...(isAudio ? ['-x', '--audio-format', 'mp3'] : ['--merge-output-format', 'mp4']),
+      '-o', outPath,
+      sourceUrl
+    ];
+    const p = spawn(ytDlpBin, args);
+    let errOut = '';
+    const timer = setTimeout(() => {
+      try { p.kill('SIGKILL'); } catch (e) {}
+      reject(new Error('YTDLP_TIMEOUT'));
+    }, timeoutMs);
+    p.stderr.on('data', d => { errOut += d.toString().slice(-600); });
+    p.on('error', err => { clearTimeout(timer); reject(err); });
+    p.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) {
+        resolve(outPath);
+      } else {
+        reject(new Error('yt-dlp exit ' + code + ': ' + errOut.slice(-240)));
+      }
     });
   });
 }
@@ -280,41 +347,46 @@ function extractYtId(url) {
   return m ? m[1] : '';
 }
 
+// Актуальні YouTube Innertube клієнти 2026 року (IOS 20.10.4 / 21.02.35 на youtubei.googleapis.com без params + ANDROID_VR 1.62.27)
 const YT_CLIENTS = [
+  {
+    n: 5,
+    name: 'IOS',
+    ver: '20.10.4',
+    endpoint: 'https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false',
+    extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.3.1.22D72', timeZone: 'UTC', utcOffsetMinutes: 0 },
+    ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X)'
+  },
+  {
+    n: 5,
+    name: 'IOS',
+    ver: '21.02.35',
+    endpoint: 'https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false',
+    extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.3.2.22D82', timeZone: 'UTC', utcOffsetMinutes: 0 },
+    ua: 'com.google.ios.youtube/21.02.35 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)'
+  },
   {
     n: 28,
     name: 'ANDROID_VR',
-    ver: '1.60.19',
-    extra: { androidSdkVersion: 32, osName: 'Android', osVersion: '12L', deviceMake: 'Oculus', deviceModel: 'Quest 3' },
-    ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip'
+    ver: '1.62.27',
+    endpoint: 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+    extra: { androidSdkVersion: 32, osName: 'Android', osVersion: '12L', deviceMake: 'Oculus', deviceModel: 'Quest 3', timeZone: 'UTC', utcOffsetMinutes: 0 },
+    ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip'
   },
   {
     n: 85,
     name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
     ver: '2.0',
+    endpoint: 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
     extra: {},
     thirdParty: { embedUrl: 'https://www.youtube.com/' },
     ua: 'Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15'
-  },
-  {
-    n: 5,
-    name: 'IOS',
-    ver: '19.45.4',
-    extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' },
-    ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)'
-  },
-  {
-    n: 3,
-    name: 'ANDROID',
-    ver: '19.44.38',
-    extra: { androidSdkVersion: 34, osName: 'Android', osVersion: '14' },
-    ua: 'com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip'
   }
 ];
 
 async function queryYtInnertubeOnRender(id) {
   const settled = await Promise.allSettled(YT_CLIENTS.map(async c => {
-    const r = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+    const r = await fetchWithTimeout(c.endpoint || 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
       headers: {
         'User-Agent': c.ua,
@@ -332,7 +404,7 @@ async function queryYtInnertubeOnRender(id) {
           ...(c.thirdParty ? { thirdParty: c.thirdParty } : {})
         }
       })
-    }, 5000);
+    }, 5500);
     const j = await r.json().catch(() => null);
     if (!j || !j.playabilityStatus || j.playabilityStatus.status !== 'OK') throw new Error('NOT_OK');
     return { client: c, data: j };
@@ -397,6 +469,38 @@ async function queryYtInnertubeOnRender(id) {
     }
   }
 
+  // Якщо IOS клієнт повернув HLS-маніфест — парсимо #EXT-X-MEDIA:TYPE=AUDIO для отримання всіх доріжок озвучки!
+  if (hlsUrl && audioTracksMap.size <= 1) {
+    try {
+      const mh = await fetchWithTimeout(hlsUrl, { headers: { 'User-Agent': hlsUa || UA } }, 4000);
+      if (mh.ok) {
+        const m3u8 = await mh.text();
+        for (const line of m3u8.split(/\r?\n/)) {
+          if (!line.startsWith('#EXT-X-MEDIA:') || !/TYPE=AUDIO/i.test(line)) continue;
+          const langM = line.match(/LANGUAGE="([^"]+)"/i);
+          const nameM = line.match(/NAME="([^"]+)"/i);
+          const uriM = line.match(/URI="([^"]+)"/i);
+          const defM = /DEFAULT=YES/i.test(line);
+          if (uriM && uriM[1]) {
+            const code = normDubCode(langM ? langM[1] : '', nameM ? nameM[1] : '');
+            if (!audioTracksMap.has(code)) {
+              audioTracksMap.set(code, {
+                lang: code,
+                label: formatDubLabel(code, nameM ? nameM[1] : ''),
+                url: uriM[1],
+                customUa: hlsUa || UA,
+                bitrate: 128000,
+                size: 0,
+                isDefault: defM,
+                isHls: true
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
   return {
     audioTracks: [...audioTracksMap.values()],
     vStreams,
@@ -409,6 +513,49 @@ async function queryYtInnertubeOnRender(id) {
   };
 }
 
+async function resolveTikTokOnRender(sourceUrl, isAudio = false) {
+  // 1) TikWM API (прямий CDN d.play без водяного знаку)
+  try {
+    const body = new URLSearchParams({ url: sourceUrl, hd: '1' }).toString();
+    const r = await fetchWithTimeout('https://www.tikwm.com/api/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'User-Agent': UA,
+        Accept: 'application/json',
+        Referer: 'https://www.tikwm.com/'
+      },
+      body
+    }, 6000);
+    const j = await r.json().catch(() => null);
+    const d = j && j.code === 0 && j.data;
+    if (d) {
+      const fixUrl = u => (!u ? '' : u.startsWith('http') ? u : 'https://www.tikwm.com' + u);
+      if (isAudio && (d.music || (d.music_info && d.music_info.play))) {
+        return { url: fixUrl(d.music || d.music_info.play), audioUrl: '', customUa: UA, referer: 'https://www.tiktok.com/' };
+      }
+      const vUrl = fixUrl(d.play) || fixUrl(d.hdplay) || fixUrl(d.wmplay);
+      if (vUrl) {
+        return { url: vUrl, audioUrl: '', customUa: UA, referer: 'https://www.tiktok.com/' };
+      }
+    }
+  } catch (e) {}
+
+  // 2) Tiklydown API
+  try {
+    const r = await fetchWithTimeout('https://api.tiklydown.eu.org/api/download?url=' + encodeURIComponent(sourceUrl), {
+      headers: { 'User-Agent': UA, Accept: 'application/json' }
+    }, 5500);
+    const j = await r.json().catch(() => null);
+    if (j && j.video) {
+      const vUrl = j.video.noWatermark || j.video.hd || j.video.watermark;
+      if (vUrl) return { url: vUrl, audioUrl: '', customUa: UA, referer: 'https://www.tiktok.com/' };
+    }
+  } catch (e) {}
+
+  return null;
+}
+
 async function resolveYouTubeOnRender(sourceUrl, quality = '1080', dubLang = '', isAudio = false) {
   const id = extractYtId(sourceUrl);
   if (!id) throw new Error('NO_YT_ID');
@@ -416,7 +563,7 @@ async function resolveYouTubeOnRender(sourceUrl, quality = '1080', dubLang = '',
   const canonUrl = 'https://www.youtube.com/watch?v=' + id;
   const targetDub = dubLang ? normDubCode(dubLang, dubLang) : '';
 
-  // 1) YouTube Innertube напряму з IP Render (ANDROID_VR + TVHTML5 + IOS + ANDROID) з підтримкою всіх доріжок озвучки!
+  // 1) YouTube Innertube напряму з IP Render (IOS 20.10.4 + ANDROID_VR 1.62.27 + TVHTML5) з підтримкою всіх доріжок озвучки!
   try {
     const inner = await queryYtInnertubeOnRender(id);
     if (inner) {
@@ -457,29 +604,66 @@ async function resolveYouTubeOnRender(sourceUrl, quality = '1080', dubLang = '',
     }
   } catch (e) {}
 
-  // 2) OceanSaver / Loader.to API (підтримує audio_language для дубляжу!)
-  try {
-    const fmt = isAudio ? 'mp3' : String(qNum);
-    const dubParam = targetDub && targetDub !== 'orig' ? `&audio_language=${encodeURIComponent(targetDub)}` : '';
-    const initUrl = `https://p.oceansaver.in/ajax/download.php?copyright=0&button=1&start=1&end=1&format=${fmt}${dubParam}&api=dfcb6d76f2f6a9894gjkege8a4ab232222&iframe_source=direct&url=${encodeURIComponent(canonUrl)}`;
-    const r = await fetchWithTimeout(initUrl, { headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' } }, 6000);
-    const j = await r.json().catch(() => null);
-    if (j && j.id) {
-      for (let step = 0; step < 12; step++) {
-        await new Promise(res => setTimeout(res, 1100));
-        const pr = await fetchWithTimeout(`https://p.oceansaver.in/ajax/progress.php?id=${encodeURIComponent(j.id)}`, {
-          headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' }
-        }, 5000);
-        const pj = await pr.json().catch(() => null);
-        if (pj && pj.download_url && /^https?:\/\//i.test(pj.download_url)) {
-          return { url: pj.download_url, audioUrl: '', customUa: UA, referer: 'https://p.oceansaver.in/' };
+  // 2) Внутрішній Cobalt v10 на Render (http://127.0.0.1:9000/)
+  if (cobaltReady) {
+    try {
+      const rCob = await fetchWithTimeout(`http://127.0.0.1:${COBALT_PORT}/`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify({
+          url: canonUrl,
+          videoQuality: String(qNum),
+          downloadMode: isAudio ? 'audio' : 'auto',
+          youtubeVideoCodec: 'h264',
+          youtubeVideoContainer: 'mp4',
+          filenameStyle: 'basic',
+          ...(targetDub && targetDub !== 'orig' ? { youtubeDubLang: targetDub } : {})
+        })
+      }, 6500);
+      const jCob = await rCob.json().catch(() => null);
+      if (jCob && jCob.status !== 'error') {
+        if (jCob.status === 'local-processing' && Array.isArray(jCob.tunnel) && jCob.tunnel.length) {
+          return {
+            url: jCob.tunnel[0].replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
+            audioUrl: (jCob.tunnel[1] || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
+            customUa: UA
+          };
         }
-        if (pj && pj.success === 1 && !pj.download_url) break;
+        const uCob = typeof jCob.url === 'string' ? jCob.url : (typeof jCob.tunnel === 'string' ? jCob.tunnel : '');
+        if (uCob) {
+          return { url: uCob.replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`), audioUrl: '', customUa: UA };
+        }
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
 
-  // 3) SaveTube CDN API
+  // 3) OceanSaver + Loader.to API паралельно (підтримує audio_language для дубляжу!)
+  const oceanBases = ['https://p.oceansaver.in', 'https://loader.to'];
+  for (const base of oceanBases) {
+    try {
+      const fmt = isAudio ? 'mp3' : String(qNum);
+      const dubParam = targetDub && targetDub !== 'orig' ? `&audio_language=${encodeURIComponent(targetDub)}` : '';
+      const initUrl = `${base}/ajax/download.php?copyright=0&button=1&start=1&end=1&format=${fmt}${dubParam}&api=dfcb6d76f2f6a9894gjkege8a4ab232222&iframe_source=direct&url=${encodeURIComponent(canonUrl)}`;
+      const r = await fetchWithTimeout(initUrl, { headers: { 'User-Agent': UA, Referer: base + '/' } }, 6000);
+      const j = await r.json().catch(() => null);
+      if (j && j.id) {
+        const pollEndpoint = j.progress_url || `${base}/ajax/progress.php?id=${encodeURIComponent(j.id)}`;
+        for (let step = 0; step < 15; step++) {
+          await new Promise(res => setTimeout(res, 900));
+          const pr = await fetchWithTimeout(pollEndpoint, {
+            headers: { 'User-Agent': UA, Referer: base + '/' }
+          }, 4500);
+          const pj = await pr.json().catch(() => null);
+          if (pj && pj.download_url && /^https?:\/\//i.test(pj.download_url)) {
+            return { url: pj.download_url, audioUrl: '', customUa: UA, referer: base + '/' };
+          }
+          if (pj && (pj.success === 1 || pj.progress >= 1000) && !pj.download_url) break;
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 4) SaveTube CDN API
   const stHosts = ['https://cdn59.savetube.su', 'https://cdn54.savetube.me', 'https://cdn61.savetube.su', 'https://cdn51.savetube.su'];
   for (const base of stHosts) {
     try {
@@ -500,7 +684,7 @@ async function resolveYouTubeOnRender(sourceUrl, quality = '1080', dubLang = '',
     } catch (e) {}
   }
 
-  // 4) Invidious API (local=true proxy)
+  // 5) Invidious API (local=true proxy)
   const invHosts = ['https://inv.nadeko.net', 'https://invidious.nerdvpn.de', 'https://invidious.jing.rocks', 'https://yewtu.be'];
   for (const base of invHosts) {
     try {
@@ -528,6 +712,12 @@ async function callInternalCobalt(sourceUrl, quality = 'max', dubLang = '', isAu
   if (isYt) {
     return resolveYouTubeOnRender(sourceUrl, quality, dubLang, isAudio);
   }
+  const isTt = /tiktok\.com/i.test(String(sourceUrl));
+  if (isTt) {
+    const ttDirect = await resolveTikTokOnRender(sourceUrl, isAudio);
+    if (ttDirect && ttDirect.url) return ttDirect;
+  }
+
   const r = await fetch(`http://127.0.0.1:${COBALT_PORT}/`, {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': UA },
@@ -605,7 +795,6 @@ async function uploadMultipartToTelegram({
 
   // Б) Якщо файл > 49.2 МБ (до 2000 МБ!) або api.telegram.org не прийняв — відправляємо через Local Bot API (127.0.0.1:8081)!
   if ((useLocalApi || stat.size > STD_TG_LIMIT) && localApiReady) {
-    // 1) Спроба через миттєвий локальний file:// URI
     try {
       const payload = {
         chat_id: chatId,
@@ -621,7 +810,6 @@ async function uploadMultipartToTelegram({
       if (jLocal && jLocal.ok && jLocal.result) return jLocal.result;
     } catch (e) {}
 
-    // 2) Спроба через multipart upload на локальний порт 8081 (підтримує до 2000 МБ)
     try {
       const rLoc = await fetch(`http://127.0.0.1:${LOCAL_API_PORT}/bot${botToken}/${method}`, {
         method: 'POST',
@@ -635,7 +823,7 @@ async function uploadMultipartToTelegram({
   throw new Error(stat.size > STD_TG_LIMIT ? 'FILE_OVER_50MB_NEED_FIT' : ('TG_UPLOAD_FAILED_SIZE_' + stat.size));
 }
 
-// ==================== 4. ОБРОБНИК /send (ВІДЕО >20 МБ ТА ДО 2 ГБ, СКЛЕЙКА 1080p, YOUTUBE МУЛЬТИ-РУШІЙ) ====================
+// ==================== 4. ОБРОБНИК /send (ВІДЕО >20 МБ ТА ДО 2 ГБ, СКЛЕЙКА 1080p, YOUTUBE МУЛЬТИ-РУШІЙ + YT-DLP) ====================
 async function handleSendMedia(body) {
   const {
     botToken, chatId, mode = 'video', url, audioUrl = '', sourceUrl = '',
@@ -654,70 +842,128 @@ async function handleSendMedia(body) {
   let activeUa = customUa || UA;
   let activeRef = referer || '';
 
-  if ((tunnelUsed || !targetUrl) && sourceUrl) {
-    const fresh = await callInternalCobalt(sourceUrl, quality || '1080', dubLang, mode === 'audio').catch(() => null);
-    if (fresh && fresh.url) {
-      targetUrl = fresh.url;
-      if (fresh.audioUrl && !targetAudio) targetAudio = fresh.audioUrl;
-      if (fresh.customUa) activeUa = fresh.customUa;
-      if (fresh.referer && !activeRef) activeRef = fresh.referer;
-    }
-  }
-
-  if (!targetUrl) throw new Error('NO_TARGET_STREAM');
-
   const filesToClean = [];
   try {
     await updateProgressMsg(botToken, chatId, progressMsgId, 30, 'Завантаження');
 
-    let finalPath = tmpFile('.mp4');
+    let finalPath = tmpFile(mode === 'audio' ? '.mp3' : '.mp4');
     filesToClean.push(finalPath);
 
     const downloadAndMux = async (vUrl, aUrl, uaToUse, refToUse, audioUaToUse = '') => {
-      const isHls = /\.m3u8(\?|$)/i.test(vUrl);
+      const isHls = /\.m3u8(\?|$)|\/manifest\/hls/i.test(vUrl);
       if (isHls) {
-        await runFfmpeg([
-          '-user_agent', uaToUse || UA,
-          ...(refToUse ? ['-headers', `Referer: ${refToUse}\r\n`] : []),
-          '-i', vUrl,
-          '-c', 'copy',
-          '-bsf:a', 'aac_adtstoasc',
-          '-movflags', '+faststart',
-          '-y', finalPath
-        ]);
+        if (aUrl) {
+          await runFfmpeg([
+            '-user_agent', uaToUse || UA,
+            ...(refToUse ? ['-headers', `Referer: ${refToUse}\r\n`] : []),
+            '-i', vUrl,
+            '-user_agent', audioUaToUse || uaToUse || UA,
+            '-i', aUrl,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-shortest',
+            '-movflags', '+faststart',
+            '-y', finalPath
+          ]);
+        } else {
+          await runFfmpeg([
+            '-user_agent', uaToUse || UA,
+            ...(refToUse ? ['-headers', `Referer: ${refToUse}\r\n`] : []),
+            '-i', vUrl,
+            '-c', 'copy',
+            '-bsf:a', 'aac_adtstoasc',
+            '-movflags', '+faststart',
+            '-y', finalPath
+          ]);
+        }
       } else if (aUrl) {
-        const vPath = tmpFile('_v.mp4');
-        const aPath = tmpFile('_a.m4a');
-        filesToClean.push(vPath, aPath);
-        await Promise.all([
-          downloadToFile(vUrl, vPath, refToUse, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження відео'), uaToUse),
-          downloadToFile(aUrl, aPath, refToUse, null, audioUaToUse || uaToUse)
-        ]);
-        await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Збірка MP4');
-        await runFfmpeg([
-          '-threads', '0',
-          '-i', vPath,
-          '-i', aPath,
-          '-c:v', 'copy',
-          '-c:a', 'aac',
-          '-map', '0:v:0',
-          '-map', '1:a:0',
-          '-shortest',
-          '-movflags', '+faststart',
-          '-y', finalPath
-        ]);
+        const isAudioHls = /\.m3u8(\?|$)|\/manifest\/hls/i.test(aUrl);
+        if (isAudioHls) {
+          const vPath = tmpFile('_v.mp4');
+          filesToClean.push(vPath);
+          await downloadToFile(vUrl, vPath, refToUse, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження відео'), uaToUse);
+          await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Збірка MP4');
+          await runFfmpeg([
+            '-threads', '0',
+            '-i', vPath,
+            '-user_agent', audioUaToUse || uaToUse || UA,
+            '-i', aUrl,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-shortest',
+            '-movflags', '+faststart',
+            '-y', finalPath
+          ]);
+        } else {
+          const vPath = tmpFile('_v.mp4');
+          const aPath = tmpFile('_a.m4a');
+          filesToClean.push(vPath, aPath);
+          await Promise.all([
+            downloadToFile(vUrl, vPath, refToUse, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження відео'), uaToUse),
+            downloadToFile(aUrl, aPath, refToUse, null, audioUaToUse || uaToUse)
+          ]);
+          await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Збірка MP4');
+          await runFfmpeg([
+            '-threads', '0',
+            '-i', vPath,
+            '-i', aPath,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-shortest',
+            '-movflags', '+faststart',
+            '-y', finalPath
+          ]);
+        }
       } else {
         await downloadToFile(vUrl, finalPath, refToUse, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження'), uaToUse);
       }
     };
 
-    try {
-      await downloadAndMux(targetUrl, targetAudio, activeUa, activeRef);
-    } catch (dlErr) {
-      if (!sourceUrl) throw dlErr;
-      // Якщо первинне посилання видало помилку (напр. 403/500), резолвимо свіжий потік за sourceUrl на IP Render!
-      const fresh2 = await callInternalCobalt(sourceUrl, quality || '720', dubLang, mode === 'audio');
-      await downloadAndMux(fresh2.url, fresh2.audioUrl || '', fresh2.customUa || UA, fresh2.referer || activeRef, fresh2.audioUa || fresh2.customUa || UA);
+    let downloadedOk = false;
+
+    // 1) Якщо передано вже готовий прямий потік (і не одноразовий використаний тунель) — пробуємо його
+    if (targetUrl && !tunnelUsed) {
+      try {
+        await downloadAndMux(targetUrl, targetAudio, activeUa, activeRef);
+        downloadedOk = true;
+      } catch (e) {
+        safeUnlink(finalPath);
+      }
+    }
+
+    // 2) Якщо є sourceUrl і це YouTube/TikTok або перша спроба не вдалася — резолвимо свіжий потік на Render
+    if (!downloadedOk && sourceUrl) {
+      try {
+        const fresh = await callInternalCobalt(sourceUrl, quality || '1080', dubLang, mode === 'audio');
+        if (fresh && fresh.url) {
+          await downloadAndMux(
+            fresh.url,
+            fresh.audioUrl || '',
+            fresh.customUa || activeUa,
+            fresh.referer || activeRef,
+            fresh.audioUa || fresh.customUa || activeUa
+          );
+          downloadedOk = true;
+        }
+      } catch (e) {
+        safeUnlink(finalPath);
+      }
+    }
+
+    // 3) Залізобетонний резерв через yt-dlp (якщо доступний бінарник yt-dlp)
+    if (!downloadedOk && sourceUrl && ytDlpBin) {
+      await runYtDlpToFile(sourceUrl, finalPath, quality || '1080', dubLang, mode === 'audio');
+      downloadedOk = true;
+    }
+
+    if (!downloadedOk || !fs.existsSync(finalPath)) {
+      throw new Error('DOWNLOAD_ALL_METHODS_FAILED');
     }
 
     await updateProgressMsg(botToken, chatId, progressMsgId, 95, 'Відправка в Telegram');
@@ -791,13 +1037,11 @@ async function handleCircle(body) {
   try {
     let dlUrl = url;
     if (!dlUrl && fileId) {
-      // 1) Спершу пробуємо getFile через стандартний api.telegram.org (миттєво для файлів до 20 МБ)
       let gf = await tgApiCall(botToken, 'getFile', { file_id: fileId }, false);
       let fp = gf && gf.ok && gf.result && gf.result.file_path;
       if (fp) {
         dlUrl = `https://api.telegram.org/file/bot${botToken}/${fp}`;
       } else if (localApiReady) {
-        // 2) Якщо відео > 20 МБ — качаємо через Local Bot API (підтримує до 2000 МБ і зберігає прямо в /tmp/tgbotapi!)
         gf = await tgApiCall(botToken, 'getFile', { file_id: fileId }, true);
         fp = gf && gf.ok && gf.result && gf.result.file_path;
         if (fp && fs.existsSync(fp)) {
@@ -815,7 +1059,6 @@ async function handleCircle(body) {
     }
 
     await updateProgressMsg(botToken, chatId, progressMsgId, 68, 'Обрізка у кружечок (FFmpeg)');
-    // Ставимо -t 60 ПЕРЕД -i, щоб FFmpeg декодував максимум перші 60 секунд і робив кружечок за ~0.8 сек!
     await runFfmpeg([
       '-threads', '0',
       '-t', '60',
@@ -875,6 +1118,7 @@ async function handleStickersGrid(body) {
     filesToClean.push(inPath);
 
     let dlUrl = String(url || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`);
+    let dlReferer = /tiktok/i.test(dlUrl || sourceUrl) ? 'https://www.tiktok.com/' : '';
     if (!dlUrl && fileId) {
       const gf = await tgApiCall(botToken, 'getFile', { file_id: fileId });
       const fp = gf && gf.ok && gf.result && gf.result.file_path;
@@ -884,13 +1128,22 @@ async function handleStickersGrid(body) {
     if (!dlUrl && sourceUrl) {
       const c = await callInternalCobalt(sourceUrl, 'max');
       dlUrl = c.url;
+      if (c.referer) dlReferer = c.referer;
     }
 
     await updateProgressMsg(botToken, chatId, progressMsgId, 25, 'Завантаження оригіналу');
-    await downloadToFile(dlUrl, inPath);
+    try {
+      await downloadToFile(dlUrl, inPath, dlReferer);
+    } catch (dlErr) {
+      if (sourceUrl) {
+        const c2 = await callInternalCobalt(sourceUrl, 'max');
+        await downloadToFile(c2.url, inPath, c2.referer || dlReferer);
+      } else {
+        throw dlErr;
+      }
+    }
 
     const { width, height, duration } = await probeVideoDimensions(inPath);
-    // Обчислюємо область сітки квадратиків по центру кадру (відрізаючи чорні смуги TikTok зверху і знизу)
     const maxTileW = Math.floor(width / gridCols);
     const maxTileH = Math.floor(height / gridRows);
     const tileSize = Math.max(64, Math.min(maxTileW, maxTileH));
@@ -898,7 +1151,6 @@ async function handleStickersGrid(body) {
     const gridH = tileSize * gridRows;
     const startX = Math.max(0, Math.floor((width - gridW) / 2));
     const startY = Math.max(0, Math.floor((height - gridH) / 2));
-    // Прибираємо 2% рамки всередині кожної клітинки, щоб лінії сітки з TikTok не потрапляли на стікер
     const inset = Math.max(2, Math.round(tileSize * 0.02));
     const cropSize = Math.max(32, tileSize - inset * 2);
     const clipDur = Math.min(duration || 3, 2.95).toFixed(2);
@@ -957,7 +1209,9 @@ async function handleStickersGrid(body) {
   }
 }
 
-// ==================== 7. АВТОПАРСЕР X (TWITTER) ДЛЯ ФУТБОЛЬНИХ ГОЛІВ (КОЖНІ 15 СЕК) ====================
+// ==================== 7. АВТОПАРСЕР X (TWITTER) ДЛЯ ФУТБОЛЬНИХ ГОЛІВ (КОЖНІ 15 СЕК + КЕШ НА ДИСК ТА БД) ====================
+const XWATCH_STATE_FILE = '/tmp/xwatch-state.json';
+
 function parseXUsername(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
@@ -972,12 +1226,12 @@ function parseXUsername(raw) {
 function parseTelegramChatInput(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
-  const m = s.match(/(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/([A-Za-z0-9_]{4,64})/i);
-  if (m && m[1] && !/^(?:joinchat|addstickers|share|iv)$/i.test(m[1])) {
+  const m = s.match(/(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/(?:s\/)?([A-Za-z0-9_]{4,64})/i);
+  if (m && m[1] && !/^(?:joinchat|addstickers|share|iv|c)$/i.test(m[1])) {
     return '@' + m[1];
   }
   if (/^-?\d{6,20}$/.test(s)) return s;
-  if (s.startsWith('@')) return s;
+  if (s.startsWith('@')) return s.split(/[\/?#\s]/)[0];
   if (/^[A-Za-z0-9_]{4,64}$/.test(s)) return '@' + s;
   return s;
 }
@@ -985,19 +1239,55 @@ function parseTelegramChatInput(raw) {
 const xWatchConfig = {
   enabled: process.env.X_ENABLED !== '0',
   accounts: String(process.env.X_ACCOUNTS || 'GoalsXtra,TheGoalsZone').split(',').map(parseXUsername).filter(Boolean),
+  channels: [parseTelegramChatInput(process.env.X_TARGET_CHAT || '@Fantasyargoal')].filter(Boolean),
   targetChat: parseTelegramChatInput(process.env.X_TARGET_CHAT || '@Fantasyargoal'),
   autoChats: new Set(),
   botToken: String(process.env.X_POSTER_BOT_TOKEN || process.env.BOT_TOKEN || '').trim(),
   creditText: String(process.env.X_CREDIT_TEXT || '- Uploaded by @jiijhwiazbot').trim(),
   intervalSec: Math.max(12, Number(process.env.X_INTERVAL_SEC || 15)),
   seenIds: new Set(),
-  initializedAccounts: new Set(),
+  lastSeenByAcc: {},
   lastUpdateOffset: 0,
-  webhookClearedForToken: '',
   lastCheckAt: 0,
   lastError: '',
   postedCount: 0
 };
+
+function saveXWatchStateToDisk() {
+  try {
+    const data = {
+      enabled: xWatchConfig.enabled,
+      accounts: xWatchConfig.accounts,
+      channels: xWatchConfig.channels,
+      targetChat: xWatchConfig.targetChat,
+      autoChats: [...xWatchConfig.autoChats],
+      botToken: xWatchConfig.botToken,
+      creditText: xWatchConfig.creditText,
+      seenIds: [...xWatchConfig.seenIds].slice(-400),
+      lastSeenByAcc: xWatchConfig.lastSeenByAcc,
+      postedCount: xWatchConfig.postedCount
+    };
+    fs.writeFileSync(XWATCH_STATE_FILE, JSON.stringify(data), 'utf8');
+  } catch (e) {}
+}
+
+function loadXWatchStateFromDisk() {
+  try {
+    if (!fs.existsSync(XWATCH_STATE_FILE)) return;
+    const j = JSON.parse(fs.readFileSync(XWATCH_STATE_FILE, 'utf8'));
+    if (typeof j.enabled === 'boolean') xWatchConfig.enabled = j.enabled;
+    if (Array.isArray(j.accounts) && j.accounts.length) xWatchConfig.accounts = j.accounts;
+    if (Array.isArray(j.channels) && j.channels.length) xWatchConfig.channels = j.channels;
+    if (j.targetChat) xWatchConfig.targetChat = j.targetChat;
+    if (Array.isArray(j.autoChats)) j.autoChats.forEach(c => xWatchConfig.autoChats.add(c));
+    if (j.botToken) xWatchConfig.botToken = j.botToken;
+    if (j.creditText) xWatchConfig.creditText = j.creditText;
+    if (Array.isArray(j.seenIds)) j.seenIds.forEach(id => xWatchConfig.seenIds.add(String(id)));
+    if (j.lastSeenByAcc && typeof j.lastSeenByAcc === 'object') xWatchConfig.lastSeenByAcc = { ...j.lastSeenByAcc };
+    if (Number(j.postedCount) > 0) xWatchConfig.postedCount = Number(j.postedCount);
+  } catch (e) {}
+}
+loadXWatchStateFromDisk();
 
 function isValidTweetSnowflake(idStr) {
   if (!/^\d{17,21}$/.test(String(idStr || ''))) return false;
@@ -1005,24 +1295,14 @@ function isValidTweetSnowflake(idStr) {
     const b = BigInt(idStr);
     if (b < 1400000000000000000n) return false;
     const tsMs = Number((b >> 22n) + 1288834974657n);
-    return tsMs <= Date.now() + 300000;
-  } catch (e) {
-    return false;
-  }
-}
-
-function isRecentSnowflake(idStr, maxAgeHours = 48) {
-  if (!isValidTweetSnowflake(idStr)) return false;
-  try {
-    const tsMs = Number((BigInt(idStr) >> 22n) + 1288834974657n);
-    return (Date.now() - tsMs) <= maxAgeHours * 3600 * 1000;
+    return tsMs <= Date.now() + 600000;
   } catch (e) {
     return false;
   }
 }
 
 function sortSnowflakesDesc(ids) {
-  return [...new Set(ids)].sort((a, b) => {
+  return [...new Set(ids.map(String).filter(isValidTweetSnowflake))].sort((a, b) => {
     const pa = String(a).padStart(24, '0');
     const pb = String(b).padStart(24, '0');
     return pb.localeCompare(pa);
@@ -1061,6 +1341,7 @@ async function resolveTcoToStatusId(tcoUrl) {
   return '';
 }
 
+// Паралельний пошук останніх твітів акаунта (Syndication + Nitter + DuckDuckGo)
 async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false) {
   const cleanUser = parseXUsername(rawInput);
   if (!cleanUser) return [];
@@ -1070,67 +1351,69 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
 
   const collected = [];
 
-  // Джерело 1 (ПРІОРИТЕТ №1): Живі хронологічні інстанси Nitter (RSS + Профіль)
-  // Дають реальні свіжі пости за останні хвилини (1 хв тому, 12 хв тому), на відміну від syndication!
-  const nitterHosts = ['https://nitter.jaydenha.uk', 'https://nitter.tiekoetter.com', 'https://nitter.poast.org', 'https://xcancel.com'];
-  for (const host of nitterHosts) {
-    if (collected.length >= 6) break;
-    try {
-      const rRss = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}/rss`, {
-        headers: { 'User-Agent': UA, Accept: 'application/rss+xml,text/xml,text/html,*/*' }
-      }, 5500);
-      if (rRss.ok) {
-        const xml = await rRss.text();
-        for (const m of xml.matchAll(/\/status\/(\d{17,21})/g)) {
-          if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
-        }
-      }
-    } catch (e) {}
-    if (collected.length >= 6) break;
-    try {
-      const r = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}`, {
-        headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,*/*' }
-      }, 11000);
-      if (r.ok) {
-        const html = await r.text();
-        if (html.includes('timeline-item') || html.includes('/status/')) {
+  const tasks = [
+    // 1) Офіційний віджет syndication.twitter.com (відповідає за ~250 мс)
+    (async () => {
+      try {
+        const r = await fetchWithTimeout(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}?dnt=true`, {
+          headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/json,*/*' }
+        }, 5000);
+        if (r.ok) {
+          const html = await r.text();
+          for (const m of html.matchAll(/"entry_id"\s*:\s*"tweet-(\d{17,21})"/g)) {
+            if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
+          }
           for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
             if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
           }
         }
-      }
-    } catch (e) {}
-  }
+      } catch (e) {}
+    })(),
 
-  // Джерело 2: Офіційний віджет Twitter Syndication srv/timeline-profile — БЕРЕМО ТІЛЬКИ ПОСТИ ЗА ОСТАННІ 48 ГОДИН!
-  try {
-    const r = await fetchWithTimeout(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}?dnt=true`, {
-      headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/json,*/*' }
-    }, 6000);
-    if (r.ok) {
-      const html = await r.text();
-      for (const m of html.matchAll(/"entry_id"\s*:\s*"tweet-(\d{17,21})"/g)) {
-        if (isRecentSnowflake(m[1], 48)) collected.push(m[1]);
-      }
-      for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
-        if (isRecentSnowflake(m[1], 48)) collected.push(m[1]);
-      }
-    }
-  } catch (e) {}
+    // 2) Хронологічні інстанси Nitter паралельно
+    ...['https://nitter.poast.org', 'https://nitter.privacydev.net', 'https://xcancel.com', 'https://nitter.jaydenha.uk'].map(host => (async () => {
+      try {
+        const rRss = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}/rss`, {
+          headers: { 'User-Agent': UA, Accept: 'application/rss+xml,text/xml,text/html,*/*' }
+        }, 4000);
+        if (rRss.ok) {
+          const xml = await rRss.text();
+          for (const m of xml.matchAll(/\/status\/(\d{17,21})/g)) {
+            if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
+          }
+          return;
+        }
+      } catch (e) {}
+      try {
+        const r = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}`, {
+          headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,*/*' }
+        }, 4500);
+        if (r.ok) {
+          const html = await r.text();
+          if (html.includes('timeline-item') || html.includes('/status/')) {
+            for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
+              if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
+            }
+          }
+        }
+      } catch (e) {}
+    })())
+  ];
 
-  // Джерело 3: Веб-пошук свіжих відео-постів акаунта (pic.twitter.com / status)
+  await Promise.allSettled(tasks);
+
   if (collected.length < 3) {
     try {
-      const q = encodeURIComponent(`"${cleanUser}" "pic.twitter.com"`);
+      const q = encodeURIComponent(`site:x.com/${cleanUser}/status OR "${cleanUser}" "pic.twitter.com"`);
       const r = await fetchWithTimeout(`https://html.duckduckgo.com/html/?q=${q}`, {
         headers: { 'User-Agent': UA, Accept: 'text/html,*/*' }
-      }, 6500);
+      }, 5000);
       if (r.ok) {
         const html = await r.text();
         for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
-          if (isRecentSnowflake(m[1], 168)) collected.push(m[1]);
+          if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
         }
-        const tcos = [...new Set([...html.matchAll(/(?:https?:\/\/)?t\.co\/([A-Za-z0-9]{7,12})/g)].map(m => 'https://t.co/' + m[1]))].slice(0, 5);
+        const tcos = [...new Set([...html.matchAll(/(?:https?:\/\/)?t\.co\/([A-Za-z0-9]{7,12})/g)].map(m => 'https://t.co/' + m[1]))].slice(0, 4);
         const resolved = await Promise.all(tcos.map(resolveTcoToStatusId));
         for (const sid of resolved) {
           if (sid) collected.push(sid);
@@ -1139,7 +1422,6 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
     } catch (e) {}
   }
 
-  // Джерело 4: Резервні перевірені відео-посилання t.co (тільки якщо живі джерела повернули 0)
   if (allowSeedFallback && collected.length === 0) {
     const low = cleanUser.toLowerCase();
     const seeds = SEED_X_VIDEO_TCO[low] || SEED_X_VIDEO_TCO.goalsxtra;
@@ -1149,65 +1431,98 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
     }
   }
 
-  return sortSnowflakesDesc(collected).slice(0, 12);
+  return sortSnowflakesDesc(collected).slice(0, 15);
 }
 
+// Підтримка X Amplify Video (де прямі .mp4 лежать у v.formats[] та v.variants[], а v.url є .m3u8!)
 function pickVideoFromFxObj(tObj) {
   if (!tObj || typeof tObj !== 'object') return '';
   const m = tObj.media || {};
+  let fallbackHls = '';
+
+  const extractBestFromItem = item => {
+    if (!item || typeof item !== 'object') return '';
+    const subVariants = [
+      ...(Array.isArray(item.formats) ? item.formats : []),
+      ...(Array.isArray(item.variants) ? item.variants : [])
+    ];
+    const mp4Variants = subVariants
+      .filter(f => f && f.url && !/\.m3u8(\?|$)/i.test(f.url) && (/mp4/i.test(String(f.container || f.content_type || '')) || /\.mp4/i.test(f.url)))
+      .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+    if (mp4Variants.length) return mp4Variants[0].url;
+
+    const u = item.url || (item.videos && item.videos[0] && item.videos[0].url) || '';
+    if (u && !/\.m3u8(\?|$)/i.test(u)) return u;
+    if (u && /\.m3u8(\?|$)/i.test(u) && !fallbackHls) fallbackHls = u;
+    return '';
+  };
+
   const vids = Array.isArray(m.videos) ? m.videos : [];
   for (const v of vids) {
-    if (v && v.url && !/\.m3u8(\?|$)/i.test(v.url)) return v.url;
+    const mp4 = extractBestFromItem(v);
+    if (mp4) return mp4;
   }
   const all = Array.isArray(m.all) ? m.all : [];
   for (const item of all) {
     if (item && (item.type === 'video' || item.type === 'gif')) {
-      const u = item.url || (item.videos && item.videos[0] && item.videos[0].url);
-      if (u && !/\.m3u8(\?|$)/i.test(u)) return u;
+      const mp4 = extractBestFromItem(item);
+      if (mp4) return mp4;
     }
   }
-  if (m.external && m.external.url && /\.mp4/i.test(m.external.url)) return m.external.url;
-  return '';
+  if (m.external && m.external.url) {
+    if (!/\.m3u8(\?|$)/i.test(m.external.url)) return m.external.url;
+    if (!fallbackHls) fallbackHls = m.external.url;
+  }
+  return fallbackHls;
 }
 
 function pickVideoFromVxObj(vObj) {
   if (!vObj || typeof vObj !== 'object') return '';
+  let fallbackHls = '';
   const ext = Array.isArray(vObj.media_extended) ? vObj.media_extended : [];
   for (const m of ext) {
     if (m && m.url && (m.type === 'video' || m.type === 'gif' || /\.mp4|video\.twimg\.com/i.test(m.url))) {
       if (!/\.m3u8(\?|$)/i.test(m.url)) return m.url;
+      if (!fallbackHls) fallbackHls = m.url;
     }
   }
   const urls = Array.isArray(vObj.mediaURLs) ? vObj.mediaURLs : [];
   for (const u of urls) {
-    if (u && /\.mp4|video\.twimg\.com/i.test(String(u)) && !/\.m3u8(\?|$)/i.test(String(u))) return String(u);
+    if (u && /\.mp4|video\.twimg\.com/i.test(String(u))) {
+      if (!/\.m3u8(\?|$)/i.test(String(u))) return String(u);
+      if (!fallbackHls) fallbackHls = String(u);
+    }
   }
-  return '';
+  return fallbackHls;
 }
 
 function pickVideoFromSynObj(sObj) {
   if (!sObj || typeof sObj !== 'object') return '';
+  let fallbackHls = '';
   const details = Array.isArray(sObj.mediaDetails) ? sObj.mediaDetails : [];
   for (const md of details) {
     if (md && (md.type === 'video' || md.type === 'animated_gif') && md.video_info && Array.isArray(md.video_info.variants)) {
       const mp4s = md.video_info.variants
-        .filter(v => v && v.url && (/video\/mp4/i.test(String(v.content_type || '')) || /\.mp4/i.test(v.url)))
+        .filter(v => v && v.url && !/\.m3u8(\?|$)/i.test(v.url) && (/video\/mp4/i.test(String(v.content_type || '')) || /\.mp4/i.test(v.url)))
         .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
       if (mp4s.length) return mp4s[0].url;
+      const hls = md.video_info.variants.find(v => v && v.url && /\.m3u8(\?|$)/i.test(v.url));
+      if (hls && !fallbackHls) fallbackHls = hls.url;
     }
   }
   if (sObj.video && Array.isArray(sObj.video.variants)) {
     const mp4s = sObj.video.variants
-      .filter(v => v && (v.src || v.url) && (/video\/mp4/i.test(String(v.type || v.content_type || '')) || /\.mp4/i.test(String(v.src || v.url))));
+      .filter(v => v && (v.src || v.url) && !/\.m3u8(\?|$)/i.test(String(v.src || v.url)) && (/video\/mp4/i.test(String(v.type || v.content_type || '')) || /\.mp4/i.test(String(v.src || v.url))));
     if (mp4s.length) return mp4s[mp4s.length - 1].src || mp4s[mp4s.length - 1].url;
   }
-  return '';
+  return fallbackHls;
 }
 
 async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
   const cleanUser = parseXUsername(username) || 'i';
   const BOT_UA = 'TelegramBot (like TwitterBot)';
   let mainText = '';
+  let fallbackHlsResult = null;
   const embeddedStatusIds = [];
   const embeddedTcos = [];
 
@@ -1221,7 +1536,7 @@ async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
     }
   };
 
-  // 1) FxTwitter & FixupX API (включно з Quote-твітами tw.quote та Retweet tw.retweet!)
+  // 1) FxTwitter & FixupX API (включно з Amplify v.formats[], Quote-твітами tw.quote та Retweet tw.retweet!)
   for (const base of ['https://api.fxtwitter.com', 'https://api.fixupx.com']) {
     try {
       const r = await fetchWithTimeout(`${base}/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
@@ -1237,11 +1552,13 @@ async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
 
       const directVid = pickVideoFromFxObj(t) || pickVideoFromFxObj(t.quote) || pickVideoFromFxObj(t.retweet);
       if (directVid) {
-        return {
+        const resObj = {
           videoUrl: directVid,
           text: String(mainText || (t.quote && t.quote.text) || '').replace(/https?:\/\/\S+/g, '').trim(),
           author: (t.author && (t.author.screen_name || t.author.name)) || cleanUser
         };
+        if (!/\.m3u8(\?|$)/i.test(directVid)) return resObj;
+        fallbackHlsResult = resObj;
       }
       if (t.quote && t.quote.id && String(t.quote.id) !== String(statusId)) embeddedStatusIds.push(String(t.quote.id));
       if (t.retweet && t.retweet.id && String(t.retweet.id) !== String(statusId)) embeddedStatusIds.push(String(t.retweet.id));
@@ -1249,7 +1566,7 @@ async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
     } catch (e) {}
   }
 
-  // 2) VxTwitter & FixVX API (включно з mediaURLs, qrt та retweet!)
+  // 2) VxTwitter & FixVX API
   for (const base of ['https://api.vxtwitter.com', 'https://api.fixvx.com']) {
     try {
       const r2 = await fetchWithTimeout(`${base}/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
@@ -1265,17 +1582,19 @@ async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
 
       const vxVid = pickVideoFromVxObj(j2) || pickVideoFromVxObj(j2.qrt) || pickVideoFromVxObj(j2.retweet);
       if (vxVid) {
-        return {
+        const resObj = {
           videoUrl: vxVid,
           text: String(mainText).replace(/https?:\/\/\S+/g, '').trim(),
           author: j2.user_screen_name || cleanUser
         };
+        if (!/\.m3u8(\?|$)/i.test(vxVid)) return resObj;
+        if (!fallbackHlsResult) fallbackHlsResult = resObj;
       }
       break;
     } catch (e) {}
   }
 
-  // 3) Офіційний CDN Syndication tweet-result (mediaDetails, video.variants, quoted_tweet, parent, entities.urls)
+  // 3) Офіційний CDN Syndication tweet-result
   try {
     const token = ((Number(statusId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
     const r3 = await fetchWithTimeout(`https://cdn.syndication.twimg.com/tweet-result?id=${statusId}&token=${token}&lang=en`, {
@@ -1293,11 +1612,13 @@ async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
         }
         const synVid = pickVideoFromSynObj(j3) || pickVideoFromSynObj(j3.quoted_tweet) || pickVideoFromSynObj(j3.parent) || pickVideoFromSynObj(j3.retweeted_status);
         if (synVid) {
-          return {
+          const resObj = {
             videoUrl: synVid,
             text: String(mainText).replace(/https?:\/\/\S+/g, '').trim(),
             author: (j3.user && j3.user.screen_name) || cleanUser
           };
+          if (!/\.m3u8(\?|$)/i.test(synVid)) return resObj;
+          if (!fallbackHlsResult) fallbackHlsResult = resObj;
         }
       }
     }
@@ -1322,6 +1643,8 @@ async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
       }
     }
   }
+
+  if (fallbackHlsResult) return fallbackHlsResult;
 
   // 5) Резерв через локальний Cobalt v10 на Render
   if (depth === 0 && cobaltReady) {
@@ -1350,6 +1673,7 @@ async function discoverPartnerBotChannels() {
     }, 4500);
     const j = await r.json().catch(() => null);
     if (!j || !j.ok || !Array.isArray(j.result)) return;
+    let changed = false;
     for (const upd of j.result) {
       if (upd.update_id > xWatchConfig.lastUpdateOffset) {
         xWatchConfig.lastUpdateOffset = upd.update_id;
@@ -1363,29 +1687,35 @@ async function discoverPartnerBotChannels() {
         if (newStatus === 'kicked' || newStatus === 'left') {
           xWatchConfig.autoChats.delete(String(chatObj.id));
           if (chatObj.username) xWatchConfig.autoChats.delete('@' + chatObj.username);
+          changed = true;
         } else {
           const cid = chatObj.username ? ('@' + chatObj.username) : String(chatObj.id);
           xWatchConfig.autoChats.add(cid);
+          if (!xWatchConfig.channels.some(c => c.toLowerCase() === cid.toLowerCase())) {
+            xWatchConfig.channels.push(cid);
+          }
           if (!xWatchConfig.targetChat) xWatchConfig.targetChat = cid;
+          changed = true;
         }
       }
     }
+    if (changed) saveXWatchStateToDisk();
   } catch (e) {}
 }
 
 function getAllTargetChatsForXWatch() {
   const list = [];
+  const addUnique = raw => {
+    const clean = parseTelegramChatInput(raw);
+    if (clean && !list.some(x => x.toLowerCase() === clean.toLowerCase())) {
+      list.push(clean);
+    }
+  };
+  for (const ch of (xWatchConfig.channels || [])) addUnique(ch);
   if (xWatchConfig.targetChat) {
-    for (const part of String(xWatchConfig.targetChat).split(/[,\s]+/)) {
-      const clean = parseTelegramChatInput(part);
-      if (clean) list.push(clean);
-    }
+    for (const part of String(xWatchConfig.targetChat).split(/[,\s]+/)) addUnique(part);
   }
-  for (const c of xWatchConfig.autoChats) {
-    if (c && !list.some(x => x.toLowerCase() === String(c).toLowerCase())) {
-      list.push(c);
-    }
-  }
+  for (const c of xWatchConfig.autoChats) addUnique(c);
   return list;
 }
 
@@ -1399,19 +1729,35 @@ function formatGoalCaption(rawTweetText) {
 }
 
 async function sendGoalVideoToChat(botToken, targetChat, videoUrl, caption) {
-  // 1) Спершу пробуємо пряму відправку URL через Telegram API
-  const sentDirect = await tgApiCall(botToken, 'sendVideo', {
-    chat_id: targetChat,
-    video: videoUrl,
-    caption,
-    supports_streaming: true
-  }, false);
-  if (sentDirect && sentDirect.ok && sentDirect.result) return sentDirect.result;
+  const isHls = /\.m3u8(\?|$)/i.test(videoUrl);
 
-  // 2) Якщо відео > 20 МБ або Telegram не зміг забрати за URL — качаємо на Render і заливаємо файлом (до 2000 МБ!)
+  // 1) Спершу пробуємо пряму відправку URL через Telegram API (якщо це прямий .mp4)
+  if (!isHls) {
+    const sentDirect = await tgApiCall(botToken, 'sendVideo', {
+      chat_id: targetChat,
+      video: videoUrl,
+      caption,
+      supports_streaming: true
+    }, false);
+    if (sentDirect && sentDirect.ok && sentDirect.result) return sentDirect.result;
+  }
+
+  // 2) Якщо відео є .m3u8 (HLS) або > 20 МБ або Telegram не зміг забрати за URL — качаємо/збираємо на Render і заливаємо файлом!
   const tmpVid = tmpFile('_xgoal.mp4');
   try {
-    await downloadToFile(videoUrl, tmpVid, 'https://x.com/');
+    if (isHls) {
+      await runFfmpeg([
+        '-user_agent', UA,
+        '-headers', 'Referer: https://x.com/\r\n',
+        '-i', videoUrl,
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-movflags', '+faststart',
+        '-y', tmpVid
+      ], 60000);
+    } else {
+      await downloadToFile(videoUrl, tmpVid, 'https://x.com/');
+    }
     return await uploadMultipartToTelegram({
       botToken,
       chatId: targetChat,
@@ -1431,24 +1777,44 @@ async function pollXAccountsOnce() {
   const targets = getAllTargetChatsForXWatch();
   if (!xWatchConfig.enabled || !xWatchConfig.accounts.length || !targets.length) return;
   xWatchConfig.lastCheckAt = Date.now();
+  let stateModified = false;
 
-  for (const acc of xWatchConfig.accounts) {
+  for (const rawAcc of xWatchConfig.accounts) {
+    const acc = parseXUsername(rawAcc);
+    if (!acc) continue;
+    const accKey = acc.toLowerCase();
+
     try {
       const tweetIds = await fetchLatestVideosFromXAccount(acc, false);
       if (!tweetIds.length) continue;
 
-      if (!xWatchConfig.initializedAccounts.has(acc)) {
-        tweetIds.forEach(id => xWatchConfig.seenIds.add(id));
-        xWatchConfig.initializedAccounts.add(acc);
+      const newestId = tweetIds[0];
+      const prevBaseline = xWatchConfig.lastSeenByAcc[accKey] || '';
+
+      // Перший запуск для цього акаунта: запам'ятовуємо поточний найновіший твіт як точку відліку, щоб не спамити старими постами!
+      if (!prevBaseline) {
+        xWatchConfig.lastSeenByAcc[accKey] = newestId;
+        tweetIds.forEach(id => xWatchConfig.seenIds.add(String(id)));
+        stateModified = true;
         continue;
       }
 
-      for (const tid of [...tweetIds].reverse()) {
-        if (xWatchConfig.seenIds.has(tid)) continue;
-        xWatchConfig.seenIds.add(tid);
+      // Шукаємо ТІЛЬКИ нові пости, які мають Snowflake ID суворо більший за prevBaseline!
+      const brandNewIds = tweetIds
+        .filter(tid => !xWatchConfig.seenIds.has(String(tid)) && String(tid).padStart(24, '0') > String(prevBaseline).padStart(24, '0'))
+        .reverse();
+
+      if (!brandNewIds.length) continue;
+
+      for (const tid of brandNewIds.slice(-2)) {
+        xWatchConfig.seenIds.add(String(tid));
+        if (String(tid).padStart(24, '0') > String(xWatchConfig.lastSeenByAcc[accKey] || '').padStart(24, '0')) {
+          xWatchConfig.lastSeenByAcc[accKey] = String(tid);
+        }
+        stateModified = true;
 
         const media = await resolveXVideoFromTweetId(acc, tid);
-        // Тільки відео ("not all posts, only videos")!
+        // Тільки відео: якщо в новому пості немає відео — нічого не відправляємо!
         if (!media || !media.videoUrl) continue;
 
         const caption = formatGoalCaption(media.text);
@@ -1465,6 +1831,8 @@ async function pollXAccountsOnce() {
       xWatchConfig.lastError = String((e && e.message) || e).slice(0, 200);
     }
   }
+
+  if (stateModified) saveXWatchStateToDisk();
 }
 
 setInterval(() => {
@@ -1511,8 +1879,6 @@ function checkAuth(req) {
 
 function proxyToCobalt(req, res) {
   const cleanHeaders = { ...req.headers, host: `127.0.0.1:${COBALT_PORT}` };
-  // Видаляємо заголовки проксі IP, щоб внутрішній Cobalt бачив однаковий IP (127.0.0.1)
-  // і для POST /, і для GET /tunnel (інакше Cobalt відхиляє тунель з помилкою HTTP 500!)
   delete cleanHeaders['authorization'];
   delete cleanHeaders['x-forwarded-for'];
   delete cleanHeaders['cf-connecting-ip'];
@@ -1552,6 +1918,7 @@ const server = http.createServer(async (req, res) => {
       service: 'stream-sync-node',
       cobaltReady,
       ffmpeg: true,
+      ytdlp: Boolean(ytDlpBin),
       localBotApi: localApiReady,
       localBotApiDiagnostics: {
         apiIdProvided: !!RAW_API_ID,
@@ -1565,7 +1932,8 @@ const server = http.createServer(async (req, res) => {
       xWatcher: {
         enabled: xWatchConfig.enabled,
         accounts: xWatchConfig.accounts,
-        targetChat: xWatchConfig.targetChat,
+        channels: getAllTargetChatsForXWatch(),
+        targetChat: getAllTargetChatsForXWatch().join(', ') || xWatchConfig.targetChat,
         postedCount: xWatchConfig.postedCount,
         lastCheckAt: xWatchConfig.lastCheckAt
       },
@@ -1639,13 +2007,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET') {
       await discoverPartnerBotChannels();
+      const allChannels = getAllTargetChatsForXWatch();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
         ok: true,
         enabled: xWatchConfig.enabled,
         accounts: xWatchConfig.accounts,
-        targetChat: getAllTargetChatsForXWatch().join(', ') || xWatchConfig.targetChat,
+        channels: allChannels,
+        targetChat: allChannels[0] || xWatchConfig.targetChat,
         autoChats: [...xWatchConfig.autoChats],
+        seenIds: [...xWatchConfig.seenIds].slice(-400),
+        lastSeenByAcc: xWatchConfig.lastSeenByAcc,
         hasCustomToken: !!xWatchConfig.botToken,
         creditText: xWatchConfig.creditText,
         postedCount: xWatchConfig.postedCount,
@@ -1657,12 +2029,29 @@ const server = http.createServer(async (req, res) => {
       try {
         const body = await readJsonBody(req);
         if (typeof body.enabled === 'boolean') xWatchConfig.enabled = body.enabled;
-        if (Array.isArray(body.accounts)) {
+        if (Array.isArray(body.accounts) && body.accounts.length) {
           xWatchConfig.accounts = body.accounts.map(parseXUsername).filter(Boolean);
-          xWatchConfig.initializedAccounts.clear();
         }
-        if (body.targetChat !== undefined) {
-          xWatchConfig.targetChat = parseTelegramChatInput(body.targetChat);
+        if (Array.isArray(body.channels) && body.channels.length) {
+          xWatchConfig.channels = body.channels.map(parseTelegramChatInput).filter(Boolean);
+          if (xWatchConfig.channels[0]) xWatchConfig.targetChat = xWatchConfig.channels[0];
+        } else if (body.targetChat !== undefined) {
+          const parsedChat = parseTelegramChatInput(body.targetChat);
+          if (parsedChat) {
+            xWatchConfig.targetChat = parsedChat;
+            if (!xWatchConfig.channels.some(c => c.toLowerCase() === parsedChat.toLowerCase())) {
+              xWatchConfig.channels.unshift(parsedChat);
+            }
+          }
+        }
+        if (Array.isArray(body.seenIds)) {
+          for (const id of body.seenIds) xWatchConfig.seenIds.add(String(id));
+        }
+        if (body.lastSeenByAcc && typeof body.lastSeenByAcc === 'object') {
+          xWatchConfig.lastSeenByAcc = { ...xWatchConfig.lastSeenByAcc, ...body.lastSeenByAcc };
+        }
+        if (Number(body.postedCount) > xWatchConfig.postedCount) {
+          xWatchConfig.postedCount = Number(body.postedCount);
         }
         if (body.creditText !== undefined && String(body.creditText).trim()) {
           xWatchConfig.creditText = String(body.creditText).trim();
@@ -1671,41 +2060,54 @@ const server = http.createServer(async (req, res) => {
           xWatchConfig.botToken = String(body.botToken).trim();
           await discoverPartnerBotChannels();
         }
+        saveXWatchStateToDisk();
+
         if (body.testNow) {
           const accountsToTest = body.testAccount
             ? [parseXUsername(body.testAccount)].filter(Boolean)
             : (xWatchConfig.accounts.length ? xWatchConfig.accounts : ['GoalsXtra', 'TheGoalsZone']);
-          const testChat = parseTelegramChatInput(body.testChat || '') || getAllTargetChatsForXWatch()[0] || body.adminChatId;
+          const testChats = body.testChat
+            ? [parseTelegramChatInput(body.testChat)].filter(Boolean)
+            : getAllTargetChatsForXWatch();
+          const primaryChat = testChats[0] || body.adminChatId;
           const tokToUse = xWatchConfig.botToken || body.fallbackToken || '';
           const postedList = [];
+
           for (const testAcc of accountsToTest) {
             const ids = await fetchLatestVideosFromXAccount(testAcc, true);
+            let accSent = 0;
             for (const tid of ids) {
+              if (accSent >= 2) break;
               const media = await resolveXVideoFromTweetId(testAcc, tid);
               if (media && media.videoUrl) {
                 const caption = formatGoalCaption(media.text);
-                let actualTarget = testChat;
-                let sentMsg = await sendGoalVideoToChat(tokToUse, testChat, media.videoUrl, caption).catch(() => null);
-                if (!sentMsg && body.adminChatId && String(body.adminChatId) !== String(testChat)) {
+                let actualTarget = primaryChat;
+                let sentMsg = await sendGoalVideoToChat(tokToUse, primaryChat, media.videoUrl, caption).catch(() => null);
+                if (!sentMsg && body.adminChatId && String(body.adminChatId) !== String(primaryChat)) {
                   actualTarget = body.adminChatId;
                   sentMsg = await sendGoalVideoToChat(tokToUse, body.adminChatId, media.videoUrl, caption).catch(() => null);
                 }
                 if (sentMsg) {
+                  accSent++;
+                  xWatchConfig.seenIds.add(String(tid));
                   postedList.push({ account: testAcc, tweetId: tid, targetChat: actualTarget, caption });
-                  break;
                 }
               }
             }
           }
+          saveXWatchStateToDisk();
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ ok: postedList.length > 0, posted: postedList[0] || null, postedList, targetChat: testChat }));
+          return res.end(JSON.stringify({ ok: postedList.length > 0, posted: postedList[0] || null, postedList, targetChat: primaryChat }));
         }
+
+        const allChannels = getAllTargetChatsForXWatch();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           ok: true,
           enabled: xWatchConfig.enabled,
           accounts: xWatchConfig.accounts,
-          targetChat: getAllTargetChatsForXWatch().join(', ') || xWatchConfig.targetChat,
+          channels: allChannels,
+          targetChat: allChannels[0] || xWatchConfig.targetChat,
           autoChats: [...xWatchConfig.autoChats],
           postedCount: xWatchConfig.postedCount
         }));
@@ -1726,9 +2128,10 @@ const server = http.createServer(async (req, res) => {
   return proxyToCobalt(req, res);
 });
 
+ensureYtDlp().catch(() => {});
 startCobalt();
 startLocalBotApi();
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[stream-sync-node] Gateway + Cobalt + FFmpeg + Stickers + X-Watcher listening on port ${PORT} (public: ${PUBLIC_URL})`);
+  console.log(`[stream-sync-node] Gateway + Cobalt + FFmpeg + yt-dlp + Stickers + X-Watcher listening on port ${PORT} (public: ${PUBLIC_URL})`);
 });

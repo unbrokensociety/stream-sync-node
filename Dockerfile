@@ -3,14 +3,16 @@ FROM ghcr.io/imputnet/cobalt:10
 
 USER root
 
-# Ставимо FFmpeg та бібліотеки для офіційного бінарника telegram-bot-api (Alpine)
-RUN apk add --no-cache ffmpeg libstdc++ openssl zlib ca-certificates curl
+# Ставимо FFmpeg, Python3, curl та бібліотеки для офіційного бінарника telegram-bot-api (Alpine)
+RUN apk add --no-cache ffmpeg python3 libstdc++ openssl zlib ca-certificates curl && \
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
 
 # Копіюємо готовий скомпільований бінарник Telegram Local Bot API (ліміт до 2000 МБ)
 COPY --from=tgapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 RUN chmod +x /usr/local/bin/telegram-bot-api && mkdir -p /tmp/tgbotapi /tmp/tgbotapi-tmp /helper
 
-# Копіюємо єдиний комбайн-сервер (Gateway + Cobalt Proxy + FFmpeg Media Helper + Circle + X-Watcher)
+# Копіюємо єдиний комбайн-сервер (Gateway + Cobalt Proxy + FFmpeg Media Helper + Circle + Stickers + X-Watcher)
 COPY server.js /helper/server.cjs
 
 ENV PORT=10000
