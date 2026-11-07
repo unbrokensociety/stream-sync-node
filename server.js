@@ -209,8 +209,8 @@ async function updateProgressMsg(botToken, chatId, msgId, pct, stage = 'Зава
   }).catch(() => {});
 }
 
-async function downloadToFile(url, destPath, referer = '', onPct = null) {
-  const headers = { 'User-Agent': UA, Accept: '*/*' };
+async function downloadToFile(url, destPath, referer = '', onPct = null, customUa = '') {
+  const headers = { 'User-Agent': customUa || UA, Accept: '*/*' };
   if (referer) headers.Referer = referer;
   const r = await fetch(url, { headers, redirect: 'follow' });
   if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
@@ -236,19 +236,228 @@ async function downloadToFile(url, destPath, referer = '', onPct = null) {
   return downloaded;
 }
 
-async function callInternalCobalt(sourceUrl, quality = 'max') {
+function extractYtId(url) {
+  const m = String(url || '').match(/(?:youtube\.com\/(?:watch\?(?:[^\s]*&)?v=|shorts\/|embed\/|live\/|v\/|clip\/)|youtu\.be\/)([A-Za-z0-9_-]{6,})/i);
+  return m ? m[1] : '';
+}
+
+async function resolveYouTubeOnRender(sourceUrl, quality = '1080', dubLang = '', isAudio = false) {
+  const id = extractYtId(sourceUrl);
+  if (!id) throw new Error('NO_YT_ID');
+  const qNum = Math.min(1080, Number(quality === 'max' ? 1080 : quality) || 720);
+  const canonUrl = 'https://www.youtube.com/watch?v=' + id;
+
+  // 1) Спроба через внутрішній Cobalt (якщо раптом підтримує)
+  try {
+    const r = await fetch(`http://127.0.0.1:${COBALT_PORT}/`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': UA },
+      body: JSON.stringify({
+        url: canonUrl,
+        videoQuality: String(qNum),
+        downloadMode: isAudio ? 'audio' : 'auto',
+        filenameStyle: 'basic',
+        youtubeVideoCodec: 'h264',
+        ...(dubLang && dubLang !== 'orig' ? { youtubeDubLang: dubLang } : {})
+      })
+    });
+    const j = await r.json().catch(() => null);
+    if (j && j.status !== 'error') {
+      if (j.status === 'local-processing' && Array.isArray(j.tunnel) && j.tunnel.length) {
+        return {
+          url: j.tunnel[0].replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
+          audioUrl: (j.tunnel[1] || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
+          customUa: UA,
+          referer: ''
+        };
+      }
+      const u = typeof j.url === 'string' ? j.url : (typeof j.tunnel === 'string' ? j.tunnel : '');
+      if (u) {
+        return { url: u.replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`), audioUrl: '', customUa: UA, referer: '' };
+      }
+    }
+  } catch (e) {}
+
+  // 2) YouTube Innertube напряму з IP Render (ANDROID_VR, TVHTML5_SIMPLY_EMBEDDED_PLAYER, IOS, ANDROID) зі збереженням customUa!
+  const clients = [
+    {
+      n: 28,
+      name: 'ANDROID_VR',
+      ver: '1.60.19',
+      extra: { androidSdkVersion: 32, osName: 'Android', osVersion: '12L', deviceMake: 'Oculus', deviceModel: 'Quest 3' },
+      ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip'
+    },
+    {
+      n: 85,
+      name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+      ver: '2.0',
+      extra: {},
+      thirdParty: { embedUrl: 'https://www.youtube.com/' },
+      ua: 'Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15'
+    },
+    {
+      n: 5,
+      name: 'IOS',
+      ver: '19.45.4',
+      extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' },
+      ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)'
+    },
+    {
+      n: 3,
+      name: 'ANDROID',
+      ver: '19.44.38',
+      extra: { androidSdkVersion: 34, osName: 'Android', osVersion: '14' },
+      ua: 'com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip'
+    }
+  ];
+
+  for (const c of clients) {
+    try {
+      const r = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST',
+        headers: {
+          'User-Agent': c.ua,
+          'Content-Type': 'application/json',
+          'X-YouTube-Client-Name': String(c.n),
+          'X-YouTube-Client-Version': c.ver,
+          Origin: 'https://www.youtube.com'
+        },
+        body: JSON.stringify({
+          videoId: id,
+          contentCheckOk: true,
+          racyCheckOk: true,
+          context: {
+            client: { clientName: c.name, clientVersion: c.ver, hl: 'uk', gl: 'UA', ...c.extra },
+            ...(c.thirdParty ? { thirdParty: c.thirdParty } : {})
+          }
+        })
+      }, 5000);
+      const j = await r.json().catch(() => null);
+      if (!j || !j.playabilityStatus || j.playabilityStatus.status !== 'OK') continue;
+      const sd = j.streamingData || {};
+      const adaptive = Array.isArray(sd.adaptiveFormats) ? sd.adaptiveFormats : [];
+      const prog = Array.isArray(sd.formats) ? sd.formats : [];
+
+      const audioStreams = adaptive.filter(f => f && f.url && /audio\/mp4/i.test(String(f.mimeType || '')));
+      let chosenAudio = null;
+      if (dubLang && dubLang !== 'orig') {
+        chosenAudio = audioStreams.find(f => f.audioTrack && String(f.audioTrack.id || '').toLowerCase().startsWith(dubLang.toLowerCase()));
+      }
+      if (!chosenAudio) {
+        chosenAudio = audioStreams.find(f => f.audioTrack && f.audioTrack.audioIsDefault) ||
+                      audioStreams.sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0))[0];
+      }
+
+      if (isAudio && chosenAudio && chosenAudio.url) {
+        return { url: chosenAudio.url, audioUrl: '', customUa: c.ua, referer: 'https://www.youtube.com/' };
+      }
+
+      const vStreams = adaptive.filter(f => f && f.url && /video\/mp4.*avc1/i.test(String(f.mimeType || ''))).map(f => ({
+        url: f.url,
+        q: Number((String(f.qualityLabel || '').match(/(\d{3,4})/) || [])[1] || f.height || 0)
+      })).filter(v => v.q > 0);
+
+      const exactAdapt = vStreams.find(v => v.q === qNum) || vStreams.filter(v => v.q <= qNum).sort((a, b) => b.q - a.q)[0];
+      if (exactAdapt && chosenAudio && chosenAudio.url) {
+        return { url: exactAdapt.url, audioUrl: chosenAudio.url, customUa: c.ua, referer: 'https://www.youtube.com/' };
+      }
+
+      const progMp4 = prog.filter(f => f && f.url && /video\/mp4/i.test(String(f.mimeType || ''))).map(f => ({
+        url: f.url,
+        q: Number((String(f.qualityLabel || '').match(/(\d{3,4})/) || [])[1] || f.height || 0)
+      }));
+      const bestProg = progMp4.find(v => v.q === qNum) || progMp4.sort((a, b) => b.q - a.q)[0];
+      if (bestProg && bestProg.url) {
+        return { url: bestProg.url, audioUrl: '', customUa: c.ua, referer: 'https://www.youtube.com/' };
+      }
+
+      if (sd.hlsManifestUrl) {
+        return { url: sd.hlsManifestUrl, audioUrl: '', customUa: c.ua, referer: 'https://www.youtube.com/' };
+      }
+    } catch (e) {}
+  }
+
+  // 3) SaveTube CDN API
+  const stHosts = ['https://cdn59.savetube.su', 'https://cdn54.savetube.me', 'https://cdn61.savetube.su', 'https://cdn51.savetube.su'];
+  for (const base of stHosts) {
+    try {
+      const r = await fetchWithTimeout(`${base}/info?url=${encodeURIComponent(canonUrl)}`, {
+        headers: { 'User-Agent': UA, Accept: 'application/json', Origin: 'https://yt.savetube.me', Referer: 'https://yt.savetube.me/' }
+      }, 4500);
+      if (!r.ok) continue;
+      const j = await r.json().catch(() => null);
+      const d = j && j.data;
+      if (!d) continue;
+      if (isAudio) {
+        const a = (Array.isArray(d.audio_formats) ? d.audio_formats : []).find(x => x && x.url);
+        if (a && a.url) return { url: a.url, audioUrl: '', customUa: UA, referer: 'https://yt.savetube.me/' };
+      }
+      const vids = (Array.isArray(d.video_formats) ? d.video_formats : []).filter(v => v && v.url && !(/googlevideo\.com/i.test(v.url) && /[?&]ip=/i.test(v.url)));
+      const pick = vids.find(v => Number(v.height || v.quality) === qNum) || vids[0];
+      if (pick && pick.url) return { url: pick.url, audioUrl: '', customUa: UA, referer: 'https://yt.savetube.me/' };
+    } catch (e) {}
+  }
+
+  // 4) OceanSaver / Loader.to API
+  try {
+    const fmt = isAudio ? 'mp3' : String(qNum);
+    const dubParam = dubLang && dubLang !== 'orig' ? `&audio_language=${encodeURIComponent(dubLang)}` : '';
+    const initUrl = `https://p.oceansaver.in/ajax/download.php?copyright=0&button=1&start=1&end=1&format=${fmt}${dubParam}&api=dfcb6d76f2f6a9894gjkege8a4ab232222&iframe_source=direct&url=${encodeURIComponent(canonUrl)}`;
+    const r = await fetchWithTimeout(initUrl, { headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' } }, 6000);
+    const j = await r.json().catch(() => null);
+    if (j && j.id) {
+      for (let step = 0; step < 12; step++) {
+        await new Promise(res => setTimeout(res, 1100));
+        const pr = await fetchWithTimeout(`https://p.oceansaver.in/ajax/progress.php?id=${encodeURIComponent(j.id)}`, {
+          headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' }
+        }, 5000);
+        const pj = await pr.json().catch(() => null);
+        if (pj && pj.download_url && /^https?:\/\//i.test(pj.download_url)) {
+          return { url: pj.download_url, audioUrl: '', customUa: UA, referer: 'https://p.oceansaver.in/' };
+        }
+        if (pj && pj.success === 1 && !pj.download_url) break;
+      }
+    }
+  } catch (e) {}
+
+  // 5) Invidious API (local=true proxy)
+  const invHosts = ['https://inv.nadeko.net', 'https://invidious.nerdvpn.de', 'https://invidious.jing.rocks', 'https://yewtu.be'];
+  for (const base of invHosts) {
+    try {
+      const r = await fetchWithTimeout(`${base}/api/v1/videos/${encodeURIComponent(id)}`, { headers: { 'User-Agent': UA, Accept: 'application/json' } }, 4500);
+      if (!r.ok) continue;
+      const j = await r.json().catch(() => null);
+      const streams = (j && Array.isArray(j.formatStreams) ? j.formatStreams : []).filter(f => f && f.itag);
+      if (streams.length) {
+        const pick = streams.find(f => String(f.qualityLabel || '').includes(String(qNum))) || streams[0];
+        return {
+          url: `${base}/latest_version?id=${encodeURIComponent(id)}&itag=${pick.itag}&local=true`,
+          audioUrl: '',
+          customUa: UA,
+          referer: base + '/'
+        };
+      }
+    } catch (e) {}
+  }
+
+  throw new Error('YOUTUBE_ALL_ENGINES_FAILED');
+}
+
+async function callInternalCobalt(sourceUrl, quality = 'max', dubLang = '', isAudio = false) {
   const isYt = /youtube\.com|youtu\.be/i.test(String(sourceUrl));
+  if (isYt) {
+    return resolveYouTubeOnRender(sourceUrl, quality, dubLang, isAudio);
+  }
   const r = await fetch(`http://127.0.0.1:${COBALT_PORT}/`, {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': UA },
     body: JSON.stringify({
       url: sourceUrl,
-      videoQuality: isYt ? String(quality === 'max' ? '1080' : (quality || '1080')) : String(quality || 'max'),
-      downloadMode: 'auto',
+      videoQuality: String(quality || 'max'),
+      downloadMode: isAudio ? 'audio' : 'auto',
       filenameStyle: 'basic',
-      allowH265: !isYt,
-      tiktokFullAudio: true,
-      ...(isYt ? { youtubeVideoCodec: 'h264' } : {})
+      allowH265: true,
+      tiktokFullAudio: true
     })
   });
   const j = await r.json().catch(() => null);
@@ -256,12 +465,13 @@ async function callInternalCobalt(sourceUrl, quality = 'max') {
   if (j.status === 'local-processing' && Array.isArray(j.tunnel) && j.tunnel.length) {
     return {
       url: j.tunnel[0].replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
-      audioUrl: (j.tunnel[1] || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`)
+      audioUrl: (j.tunnel[1] || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
+      customUa: UA
     };
   }
   const u = typeof j.url === 'string' ? j.url : (typeof j.tunnel === 'string' ? j.tunnel : '');
   if (!u) throw new Error('NO_COBALT_URL');
-  return { url: u.replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`), audioUrl: '' };
+  return { url: u.replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`), audioUrl: '', customUa: UA };
 }
 
 async function uploadMultipartToTelegram({
@@ -273,15 +483,56 @@ async function uploadMultipartToTelegram({
   const fileName = fileNameOverride || (mode === 'audio' ? 'audio.mp3' : mode === 'video_note' ? 'circle.mp4' : 'video.mp4');
   const mime = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
 
-  // 1) Спроба через Local Bot API (до 2000 МБ за 0.1 сек через локальний шлях file://)
-  if (useLocalApi && localApiReady) {
+  const buildMultipartForm = () => {
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    if (caption && mode !== 'video_note') {
+      form.append('caption', String(caption));
+      form.append('parse_mode', 'HTML');
+    }
+    if (mode === 'video') {
+      form.append('supports_streaming', 'true');
+      form.append('show_caption_above_media', 'true');
+    }
+    if (mode === 'video_note') {
+      form.append('length', '384');
+    }
+    if (replyToMsgId) {
+      form.append('reply_parameters', JSON.stringify({ message_id: Number(replyToMsgId), allow_sending_without_reply: true }));
+    }
+    if (businessConnectionId) {
+      form.append('business_connection_id', String(businessConnectionId));
+    }
+    if (replyMarkup) {
+      form.append('reply_markup', typeof replyMarkup === 'string' ? replyMarkup : JSON.stringify(replyMarkup));
+    }
+    const fileBuf = fs.readFileSync(filePath);
+    form.append(field, new Blob([fileBuf], { type: mime }), fileName);
+    return form;
+  };
+
+  // А) Якщо файл <= 49.2 МБ — спершу відправляємо на api.telegram.org (щоб file_id гарантовано кешувався в основній сесії бота!)
+  if (stat.size <= STD_TG_LIMIT) {
+    try {
+      const rStd = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+        method: 'POST',
+        body: buildMultipartForm()
+      });
+      const jStd = await rStd.json().catch(() => null);
+      if (jStd && jStd.ok && jStd.result) return jStd.result;
+    } catch (e) {}
+  }
+
+  // Б) Якщо файл > 49.2 МБ (до 2000 МБ!) або api.telegram.org не прийняв — відправляємо через Local Bot API (127.0.0.1:8081)!
+  if ((useLocalApi || stat.size > STD_TG_LIMIT) && localApiReady) {
+    // 1) Спроба через миттєвий локальний file:// URI
     try {
       const payload = {
         chat_id: chatId,
         [field]: 'file://' + filePath,
         ...(caption && mode !== 'video_note' ? { caption, parse_mode: 'HTML' } : {}),
         ...(mode === 'video' ? { supports_streaming: true, show_caption_above_media: true } : {}),
-        ...(mode === 'video_note' ? { length: 480 } : {}),
+        ...(mode === 'video_note' ? { length: 384 } : {}),
         ...(replyToMsgId ? { reply_parameters: { message_id: Number(replyToMsgId), allow_sending_without_reply: true } } : {}),
         ...(businessConnectionId ? { business_connection_id: businessConnectionId } : {}),
         ...(replyMarkup ? { reply_markup: replyMarkup } : {})
@@ -289,54 +540,26 @@ async function uploadMultipartToTelegram({
       const jLocal = await tgApiCall(botToken, method, payload, true);
       if (jLocal && jLocal.ok && jLocal.result) return jLocal.result;
     } catch (e) {}
+
+    // 2) Спроба через multipart upload на локальний порт 8081 (підтримує до 2000 МБ)
+    try {
+      const rLoc = await fetch(`http://127.0.0.1:${LOCAL_API_PORT}/bot${botToken}/${method}`, {
+        method: 'POST',
+        body: buildMultipartForm()
+      });
+      const jLoc = await rLoc.json().catch(() => null);
+      if (jLoc && jLoc.ok && jLoc.result) return jLoc.result;
+    } catch (e) {}
   }
 
-  // 2) Стандартний multipart upload на api.telegram.org (до 50 МБ)
-  if (stat.size > STD_TG_LIMIT) {
-    throw new Error('FILE_OVER_50MB_NEED_FIT');
-  }
-
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  if (caption && mode !== 'video_note') {
-    form.append('caption', String(caption));
-    form.append('parse_mode', 'HTML');
-  }
-  if (mode === 'video') {
-    form.append('supports_streaming', 'true');
-    form.append('show_caption_above_media', 'true');
-  }
-  if (mode === 'video_note') {
-    form.append('length', '480');
-  }
-  if (replyToMsgId) {
-    form.append('reply_parameters', JSON.stringify({ message_id: Number(replyToMsgId), allow_sending_without_reply: true }));
-  }
-  if (businessConnectionId) {
-    form.append('business_connection_id', String(businessConnectionId));
-  }
-  if (replyMarkup) {
-    form.append('reply_markup', typeof replyMarkup === 'string' ? replyMarkup : JSON.stringify(replyMarkup));
-  }
-
-  const fileBuf = fs.readFileSync(filePath);
-  form.append(field, new Blob([fileBuf], { type: mime }), fileName);
-
-  const r = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
-    method: 'POST',
-    body: form
-  });
-  const j = await r.json().catch(() => null);
-  if (!j || !j.ok) {
-    throw new Error((j && j.description) || ('TG_UPLOAD_' + r.status + '_SIZE_' + stat.size));
-  }
-  return j.result;
+  throw new Error(stat.size > STD_TG_LIMIT ? 'FILE_OVER_50MB_NEED_FIT' : ('TG_UPLOAD_FAILED_SIZE_' + stat.size));
 }
 
-// ==================== 4. ОБРОБНИК /send (ВІДЕО >20 МБ ТА ДО 2 ГБ, СКЛЕЙКА 1080p, АВТО-СПЛІТ/ФІТ) ====================
+// ==================== 4. ОБРОБНИК /send (ВІДЕО >20 МБ ТА ДО 2 ГБ, СКЛЕЙКА 1080p, YOUTUBE МУЛЬТИ-РУШІЙ) ====================
 async function handleSendMedia(body) {
   const {
-    botToken, chatId, mode = 'video', url, audioUrl = '', sourceUrl = '', tunnelUsed = false,
+    botToken, chatId, mode = 'video', url, audioUrl = '', sourceUrl = '',
+    quality = '1080', dubLang = '', customUa = '', tunnelUsed = false,
     referer = '', caption = '', replyMarkup = null, replyToMsgId = null, replyToMessageId = null,
     businessConnectionId = null, progressMsgId = null
   } = body || {};
@@ -348,14 +571,20 @@ async function handleSendMedia(body) {
 
   let targetUrl = String(url || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`);
   let targetAudio = String(audioUrl || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`);
+  let activeUa = customUa || UA;
+  let activeRef = referer || '';
 
   if ((tunnelUsed || !targetUrl) && sourceUrl) {
-    const fresh = await callInternalCobalt(sourceUrl, '1080').catch(() => null);
+    const fresh = await callInternalCobalt(sourceUrl, quality || '1080', dubLang, mode === 'audio').catch(() => null);
     if (fresh && fresh.url) {
       targetUrl = fresh.url;
       if (fresh.audioUrl && !targetAudio) targetAudio = fresh.audioUrl;
+      if (fresh.customUa) activeUa = fresh.customUa;
+      if (fresh.referer && !activeRef) activeRef = fresh.referer;
     }
   }
+
+  if (!targetUrl) throw new Error('NO_TARGET_STREAM');
 
   const filesToClean = [];
   try {
@@ -364,44 +593,55 @@ async function handleSendMedia(body) {
     let finalPath = tmpFile('.mp4');
     filesToClean.push(finalPath);
 
-    const isHls = /\.m3u8(\?|$)/i.test(targetUrl);
-    if (isHls) {
-      await runFfmpeg([
-        '-user_agent', UA,
-        ...(referer ? ['-headers', `Referer: ${referer}\r\n`] : []),
-        '-i', targetUrl,
-        '-c', 'copy',
-        '-bsf:a', 'aac_adtstoasc',
-        '-movflags', '+faststart',
-        '-y', finalPath
-      ]);
-    } else if (targetAudio) {
-      const vPath = tmpFile('_v.mp4');
-      const aPath = tmpFile('_a.m4a');
-      filesToClean.push(vPath, aPath);
-      await Promise.all([
-        downloadToFile(targetUrl, vPath, referer, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження 1080p')),
-        downloadToFile(targetAudio, aPath, referer)
-      ]);
-      await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Збірка MP4');
-      await runFfmpeg([
-        '-i', vPath,
-        '-i', aPath,
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-shortest',
-        '-movflags', '+faststart',
-        '-y', finalPath
-      ]);
-    } else {
-      await downloadToFile(targetUrl, finalPath, referer, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження'));
+    const downloadAndMux = async (vUrl, aUrl, uaToUse, refToUse) => {
+      const isHls = /\.m3u8(\?|$)/i.test(vUrl);
+      if (isHls) {
+        await runFfmpeg([
+          '-user_agent', uaToUse || UA,
+          ...(refToUse ? ['-headers', `Referer: ${refToUse}\r\n`] : []),
+          '-i', vUrl,
+          '-c', 'copy',
+          '-bsf:a', 'aac_adtstoasc',
+          '-movflags', '+faststart',
+          '-y', finalPath
+        ]);
+      } else if (aUrl) {
+        const vPath = tmpFile('_v.mp4');
+        const aPath = tmpFile('_a.m4a');
+        filesToClean.push(vPath, aPath);
+        await Promise.all([
+          downloadToFile(vUrl, vPath, refToUse, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження відео'), uaToUse),
+          downloadToFile(aUrl, aPath, refToUse, null, uaToUse)
+        ]);
+        await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Збірка MP4');
+        await runFfmpeg([
+          '-threads', '0',
+          '-i', vPath,
+          '-i', aPath,
+          '-c:v', 'copy',
+          '-c:a', 'aac',
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-shortest',
+          '-movflags', '+faststart',
+          '-y', finalPath
+        ]);
+      } else {
+        await downloadToFile(vUrl, finalPath, refToUse, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження'), uaToUse);
+      }
+    };
+
+    try {
+      await downloadAndMux(targetUrl, targetAudio, activeUa, activeRef);
+    } catch (dlErr) {
+      if (!sourceUrl) throw dlErr;
+      // Якщо первинне посилання видало помилку (напр. 403/500), резолвимо свіжий потік за sourceUrl на IP Render!
+      const fresh2 = await callInternalCobalt(sourceUrl, quality || '720', dubLang, mode === 'audio');
+      await downloadAndMux(fresh2.url, fresh2.audioUrl || '', fresh2.customUa || UA, fresh2.referer || activeRef);
     }
 
     await updateProgressMsg(botToken, chatId, progressMsgId, 95, 'Відправка в Telegram');
 
-    // Спершу пробуємо відправити оригінал (якщо запущений Local Bot API — пройде до 2000 МБ!)
     try {
       const result = await uploadMultipartToTelegram({
         botToken,
@@ -416,7 +656,6 @@ async function handleSendMedia(body) {
       });
       return { ok: true, result };
     } catch (uploadErr) {
-      // Якщо файл > 50 МБ і бот працює через хмарний api.telegram.org — автоматично стискаємо під 49 МБ через FFmpeg!
       const stat = fs.statSync(finalPath);
       if (stat.size <= STD_TG_LIMIT) throw uploadErr;
 
@@ -424,6 +663,7 @@ async function handleSendMedia(body) {
       const compPath = tmpFile('_fit.mp4');
       filesToClean.push(compPath);
       await runFfmpeg([
+        '-threads', '0',
         '-i', finalPath,
         '-vf', "scale='min(1280,iw)':-2",
         '-c:v', 'libx264',
@@ -454,7 +694,7 @@ async function handleSendMedia(body) {
   }
 }
 
-// ==================== 5. ОБРОБНИК /circle (ІДЕАЛЬНІ КРУЖЕЧКИ ЧЕРЕЗ СПРАВЖНІЙ FFMPEG) ====================
+// ==================== 5. ОБРОБНИК /circle (НАДШВИДКІ КРУЖЕЧКИ ЗА 1-2 СЕКУНДИ ЧЕРЕЗ FFMPEG) ====================
 async function handleCircle(body) {
   const {
     botToken, chatId, fileId = '', url = '', replyToMsgId = null,
@@ -467,20 +707,39 @@ async function handleCircle(body) {
 
   const inPath = tmpFile('_in.mp4');
   const outPath = tmpFile('_circle.mp4');
+  let inputFileToUse = inPath;
   try {
     let dlUrl = url;
     if (!dlUrl && fileId) {
-      const gf = await tgApiCall(botToken, 'getFile', { file_id: fileId });
-      const fp = gf && gf.ok && gf.result && gf.result.file_path;
-      if (!fp) throw new Error('GET_FILE_FAILED');
-      dlUrl = `https://api.telegram.org/file/bot${botToken}/${fp}`;
+      // 1) Спершу пробуємо getFile через стандартний api.telegram.org (миттєво для файлів до 20 МБ)
+      let gf = await tgApiCall(botToken, 'getFile', { file_id: fileId }, false);
+      let fp = gf && gf.ok && gf.result && gf.result.file_path;
+      if (fp) {
+        dlUrl = `https://api.telegram.org/file/bot${botToken}/${fp}`;
+      } else if (localApiReady) {
+        // 2) Якщо відео > 20 МБ — качаємо через Local Bot API (підтримує до 2000 МБ і зберігає прямо в /tmp/tgbotapi!)
+        gf = await tgApiCall(botToken, 'getFile', { file_id: fileId }, true);
+        fp = gf && gf.ok && gf.result && gf.result.file_path;
+        if (fp && fs.existsSync(fp)) {
+          inputFileToUse = fp;
+        } else if (fp) {
+          dlUrl = `http://127.0.0.1:${LOCAL_API_PORT}/file/bot${botToken}/${fp.replace(/^\/+/, '')}`;
+        }
+      }
+      if (!dlUrl && inputFileToUse === inPath) throw new Error('GET_FILE_FAILED');
     }
 
-    await updateProgressMsg(botToken, chatId, progressMsgId, 55, 'Швидка обрізка у кружечок');
-    const ffArgs = srcInput => [
+    if (inputFileToUse === inPath) {
+      await updateProgressMsg(botToken, chatId, progressMsgId, 35, 'Завантаження відео');
+      await downloadToFile(dlUrl, inPath);
+    }
+
+    await updateProgressMsg(botToken, chatId, progressMsgId, 68, 'Обрізка у кружечок (FFmpeg)');
+    // Ставимо -t 60 ПЕРЕД -i, щоб FFmpeg декодував максимум перші 60 секунд і робив кружечок за ~0.8 сек!
+    await runFfmpeg([
       '-threads', '0',
-      '-i', srcInput,
       '-t', '60',
+      '-i', inputFileToUse,
       '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=384:384,setsar=1",
       '-r', '30',
       '-c:v', 'libx264',
@@ -496,17 +755,9 @@ async function handleCircle(body) {
       '-b:a', '96k',
       '-movflags', '+faststart',
       '-y', outPath
-    ];
+    ], 45000);
 
-    try {
-      // Потокова конвертація напряму з URL в один прохід (без очікування подвійного запису на диск!)
-      await runFfmpeg(ffArgs(dlUrl), 45000);
-    } catch (e) {
-      await downloadToFile(dlUrl, inPath);
-      await runFfmpeg(ffArgs(inPath), 45000);
-    }
-
-    await updateProgressMsg(botToken, chatId, progressMsgId, 92, 'Відправка кружечка');
+    await updateProgressMsg(botToken, chatId, progressMsgId, 94, 'Відправка кружечка');
     const result = await uploadMultipartToTelegram({
       botToken,
       chatId,
@@ -515,7 +766,7 @@ async function handleCircle(body) {
       replyMarkup,
       replyToMsgId,
       businessConnectionId,
-      useLocalApi: localApiReady
+      useLocalApi: false
     });
     return { ok: true, result };
   } finally {
