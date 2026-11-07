@@ -534,7 +534,7 @@ async function resolveTikTokOnRender(sourceUrl, isAudio = false) {
       if (isAudio && (d.music || (d.music_info && d.music_info.play))) {
         return { url: fixUrl(d.music || d.music_info.play), audioUrl: '', customUa: UA, referer: 'https://www.tiktok.com/' };
       }
-      const vUrl = fixUrl(d.play) || fixUrl(d.hdplay) || fixUrl(d.wmplay);
+      const vUrl = fixUrl(d.play) || fixUrl(d.hdplay);
       if (vUrl) {
         return { url: vUrl, audioUrl: '', customUa: UA, referer: 'https://www.tiktok.com/' };
       }
@@ -548,7 +548,7 @@ async function resolveTikTokOnRender(sourceUrl, isAudio = false) {
     }, 5500);
     const j = await r.json().catch(() => null);
     if (j && j.video) {
-      const vUrl = j.video.noWatermark || j.video.hd || j.video.watermark;
+      const vUrl = j.video.noWatermark || j.video.hd;
       if (vUrl) return { url: vUrl, audioUrl: '', customUa: UA, referer: 'https://www.tiktok.com/' };
     }
   } catch (e) {}
@@ -727,7 +727,7 @@ async function callInternalCobalt(sourceUrl, quality = 'max', dubLang = '', isAu
       downloadMode: isAudio ? 'audio' : 'auto',
       filenameStyle: 'basic',
       allowH265: true,
-      tiktokFullAudio: true
+      ...(isAudio ? { tiktokFullAudio: true } : {})
     })
   });
   const j = await r.json().catch(() => null);
@@ -1877,6 +1877,173 @@ function checkAuth(req) {
   return clean === API_KEY;
 }
 
+// Карта реєстрації тунелів Cobalt + Yoinks (pablostanley/yoinks архітектура: yt-dlp + ffmpeg + Cobalt v10)
+const cobaltTunnelFallbackMap = new Map();
+
+function rememberTunnelMeta(id, meta) {
+  if (!id || !meta) return;
+  if (cobaltTunnelFallbackMap.size > 500) {
+    const firstKey = cobaltTunnelFallbackMap.keys().next().value;
+    if (firstKey) cobaltTunnelFallbackMap.delete(firstKey);
+  }
+  cobaltTunnelFallbackMap.set(id, { ...meta, ts: Date.now() });
+}
+
+function extractTunnelIdFromUrl(u) {
+  try {
+    const qs = String(u || '').split('?')[1] || '';
+    return new URLSearchParams(qs).get('id') || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+async function streamViaYoinksEngine(meta, res) {
+  const { url: sourceUrl, quality = '1080', dubLang = '', isAudio = false } = meta || {};
+  if (!sourceUrl) {
+    if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ status: 'error', error: { code: 'no_source_url' } }));
+  }
+
+  const ext = isAudio ? '.mp3' : '.mp4';
+  const outPath = tmpFile('_yoink' + ext);
+  const extraFiles = [outPath];
+
+  try {
+    let ready = false;
+    // 1) Спершу швидкий резолвер (TikWM no-watermark / YouTube Innertube / OceanSaver)
+    try {
+      const resolved = await callInternalCobalt(sourceUrl, quality, dubLang, isAudio);
+      if (resolved && resolved.url) {
+        const isHls = /\.m3u8(\?|$)|\/manifest\/hls/i.test(resolved.url);
+        if (isHls) {
+          await runFfmpeg([
+            '-user_agent', resolved.customUa || UA,
+            ...(resolved.referer ? ['-headers', `Referer: ${resolved.referer}\r\n`] : []),
+            '-i', resolved.url,
+            '-c', 'copy',
+            '-bsf:a', 'aac_adtstoasc',
+            '-movflags', '+faststart',
+            '-y', outPath
+          ], 55000);
+          ready = true;
+        } else if (resolved.audioUrl) {
+          const vP = tmpFile('_yv.mp4');
+          const aP = tmpFile('_ya.m4a');
+          extraFiles.push(vP, aP);
+          await Promise.all([
+            downloadToFile(resolved.url, vP, resolved.referer || '', null, resolved.customUa || UA),
+            downloadToFile(resolved.audioUrl, aP, resolved.referer || '', null, resolved.audioUa || resolved.customUa || UA)
+          ]);
+          await runFfmpeg([
+            '-threads', '0', '-i', vP, '-i', aP,
+            '-c:v', 'copy', '-c:a', 'aac',
+            '-map', '0:v:0', '-map', '1:a:0',
+            '-shortest', '-movflags', '+faststart', '-y', outPath
+          ], 55000);
+          ready = true;
+        } else {
+          await downloadToFile(resolved.url, outPath, resolved.referer || '', null, resolved.customUa || UA);
+          ready = true;
+        }
+      }
+    } catch (e) {
+      safeUnlink(outPath);
+    }
+
+    // 2) Резерв через рушій Yoinks (yt-dlp + ffmpeg)
+    if (!ready && ytDlpBin) {
+      await runYtDlpToFile(sourceUrl, outPath, quality, dubLang, isAudio, 50000);
+      ready = true;
+    }
+
+    if (!ready || !fs.existsSync(outPath)) {
+      throw new Error('YOINKS_STREAM_FAILED');
+    }
+
+    const stat = fs.statSync(outPath);
+    res.writeHead(200, {
+      'Content-Type': isAudio ? 'audio/mpeg' : 'video/mp4',
+      'Content-Length': String(stat.size),
+      'Content-Disposition': `inline; filename="media${ext}"`,
+      'Cache-Control': 'no-store'
+    });
+    const rs = fs.createReadStream(outPath);
+    rs.on('close', () => extraFiles.forEach(safeUnlink));
+    rs.on('error', () => extraFiles.forEach(safeUnlink));
+    rs.pipe(res);
+  } catch (e) {
+    extraFiles.forEach(safeUnlink);
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+    }
+    res.end(JSON.stringify({ status: 'error', error: { code: 'yoinks_fallback_failed', detail: String(e.message || e) } }));
+  }
+}
+
+async function handleCobaltPostWithYoinksFallback(req, res) {
+  let body = {};
+  try {
+    body = await readJsonBody(req);
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ status: 'error', error: { code: 'error.api.invalid_body' } }));
+  }
+
+  const sourceUrl = String(body.url || '').trim();
+  const isAudio = body.downloadMode === 'audio' || body.isAudioOnly === true;
+  const quality = String(body.videoQuality || body.vQuality || '1080');
+  const dubLang = String(body.youtubeDubLang || '');
+
+  // Прибираємо tiktokFullAudio на відео-запитах, щоб Cobalt v10 не видавав HTTP 500 у /tunnel
+  const cleanBody = { ...body };
+  if (!isAudio) {
+    delete cleanBody.tiktokFullAudio;
+    delete cleanBody.isTTFullAudio;
+  }
+
+  try {
+    const r = await fetchWithTimeout(`http://127.0.0.1:${COBALT_PORT}/`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': UA
+      },
+      body: JSON.stringify(cleanBody)
+    }, 7500);
+
+    const j = await r.json().catch(() => null);
+    if (j && j.status && j.status !== 'error') {
+      const meta = { url: sourceUrl, quality, dubLang, isAudio };
+      if (typeof j.url === 'string' && j.url.includes('/tunnel')) {
+        rememberTunnelMeta(extractTunnelIdFromUrl(j.url), meta);
+      }
+      if (Array.isArray(j.tunnel)) {
+        for (const tu of j.tunnel) rememberTunnelMeta(extractTunnelIdFromUrl(tu), meta);
+      }
+      if (Array.isArray(j.picker)) {
+        for (const p of j.picker) {
+          if (p && p.url && p.url.includes('/tunnel')) rememberTunnelMeta(extractTunnelIdFromUrl(p.url), meta);
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(j));
+    }
+  } catch (e) {}
+
+  // Якщо внутрішній Cobalt v10 повернув помилку (напр. на YouTube або TikTok) — автоматично вмикаємо рушій Yoinks!
+  const yoinkId = crypto.randomBytes(12).toString('hex');
+  rememberTunnelMeta(yoinkId, { url: sourceUrl, quality, dubLang, isAudio });
+  const ext = isAudio ? 'mp3' : 'mp4';
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  return res.end(JSON.stringify({
+    status: 'tunnel',
+    url: `${PUBLIC_URL}/yoink-stream?id=${yoinkId}`,
+    filename: `video_${quality === 'max' ? '1080' : quality}p.${ext}`
+  }));
+}
+
 function proxyToCobalt(req, res) {
   const cleanHeaders = { ...req.headers, host: `127.0.0.1:${COBALT_PORT}` };
   delete cleanHeaders['authorization'];
@@ -1887,6 +2054,9 @@ function proxyToCobalt(req, res) {
   delete cleanHeaders['x-client-ip'];
   delete cleanHeaders['forwarded'];
 
+  const isTunnelGet = req.method === 'GET' && String(req.url || '').startsWith('/tunnel');
+  const tunnelId = isTunnelGet ? extractTunnelIdFromUrl(req.url) : '';
+
   const options = {
     hostname: '127.0.0.1',
     port: COBALT_PORT,
@@ -1896,10 +2066,20 @@ function proxyToCobalt(req, res) {
   };
 
   const proxyReq = http.request(options, proxyRes => {
-    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    const code = proxyRes.statusCode || 502;
+    // Якщо внутрішній Cobalt v10 /tunnel повернув помилку HTTP 500/403/404 — перехоплюємо її і віддаємо відео через Yoinks!
+    if (isTunnelGet && code >= 400 && tunnelId && cobaltTunnelFallbackMap.has(tunnelId)) {
+      proxyRes.resume();
+      const meta = cobaltTunnelFallbackMap.get(tunnelId);
+      return streamViaYoinksEngine(meta, res);
+    }
+    res.writeHead(code, proxyRes.headers);
     proxyRes.pipe(res, { end: true });
   });
   proxyReq.on('error', err => {
+    if (isTunnelGet && tunnelId && cobaltTunnelFallbackMap.has(tunnelId) && !res.headersSent) {
+      return streamViaYoinksEngine(cobaltTunnelFallbackMap.get(tunnelId), res);
+    }
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
     }
@@ -2118,11 +2298,23 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'GET' && u === '/yoink-stream') {
+    const qs = String(req.url || '').split('?')[1] || '';
+    const id = new URLSearchParams(qs).get('id') || '';
+    const meta = cobaltTunnelFallbackMap.get(id);
+    if (!meta) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ status: 'error', error: { code: 'yoink_tunnel_expired' } }));
+    }
+    return streamViaYoinksEngine(meta, res);
+  }
+
   if (req.method === 'POST' && (u === '/' || u === '/api/json')) {
     if (!checkAuth(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }));
     }
+    return handleCobaltPostWithYoinksFallback(req, res);
   }
 
   return proxyToCobalt(req, res);
