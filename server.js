@@ -182,6 +182,45 @@ function probeVideoDimensions(filePath) {
   });
 }
 
+function fetchWithTimeout(url, options = {}, timeoutMs = 6000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+const DUB_FLAGS = {
+  uk: '🇺🇦 UK', ua: '🇺🇦 UK', en: '🇬🇧 EN', ru: 'RU', pl: '🇵🇱 PL', de: '🇩🇪 DE',
+  es: '🇪🇸 ES', fr: '🇫🇷 FR', it: '🇮🇹 IT', pt: '🇧🇷 PT', tr: '🇹🇷 TR', ar: '🇸🇦 AR',
+  hi: '🇮🇳 HI', id: '🇮🇩 ID', kk: '🇰🇿 KK', ja: '🇯🇵 JA', ko: '🇰🇷 KO', zh: '🇨🇳 ZH'
+};
+
+function normDubCode(rawIdOrLocale, rawName = '') {
+  const s = String(rawIdOrLocale || '').toLowerCase().split(/[._-]/)[0];
+  if (s && s.length >= 2 && s.length <= 3) return s === 'ua' ? 'uk' : s;
+  const n = String(rawName || '').toLowerCase();
+  if (/укр|ukrain/i.test(n)) return 'uk';
+  if (/рус|russian/i.test(n)) return 'ru';
+  if (/англ|english/i.test(n)) return 'en';
+  if (/исп|ісп|spanish|español/i.test(n)) return 'es';
+  if (/нем|нім|german|deutsch/i.test(n)) return 'de';
+  if (/франц|french|français/i.test(n)) return 'fr';
+  if (/итал|італ|italian/i.test(n)) return 'it';
+  if (/порт|portug/i.test(n)) return 'pt';
+  if (/тур|turk/i.test(n)) return 'tr';
+  if (/араб|arab/i.test(n)) return 'ar';
+  if (/хинд|хінд|hindi/i.test(n)) return 'hi';
+  if (/польс|polish|polski/i.test(n)) return 'pl';
+  if (/индон|індон|indones/i.test(n)) return 'id';
+  if (/казах|kazakh/i.test(n)) return 'kk';
+  return s || 'orig';
+}
+
+function formatDubLabel(code, rawName = '') {
+  if (DUB_FLAGS[code]) return DUB_FLAGS[code];
+  const clean = String(rawName || '').replace(/\s*\(.*?\)\s*/g, '').trim();
+  return (clean || code).toUpperCase().slice(0, 10);
+}
+
 async function tgApiCall(botToken, method, payload, useLocal = false) {
   const base = (useLocal && localApiReady)
     ? `http://127.0.0.1:${LOCAL_API_PORT}/bot${botToken}/${method}`
@@ -241,141 +280,204 @@ function extractYtId(url) {
   return m ? m[1] : '';
 }
 
+const YT_CLIENTS = [
+  {
+    n: 28,
+    name: 'ANDROID_VR',
+    ver: '1.60.19',
+    extra: { androidSdkVersion: 32, osName: 'Android', osVersion: '12L', deviceMake: 'Oculus', deviceModel: 'Quest 3' },
+    ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip'
+  },
+  {
+    n: 85,
+    name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+    ver: '2.0',
+    extra: {},
+    thirdParty: { embedUrl: 'https://www.youtube.com/' },
+    ua: 'Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15'
+  },
+  {
+    n: 5,
+    name: 'IOS',
+    ver: '19.45.4',
+    extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' },
+    ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)'
+  },
+  {
+    n: 3,
+    name: 'ANDROID',
+    ver: '19.44.38',
+    extra: { androidSdkVersion: 34, osName: 'Android', osVersion: '14' },
+    ua: 'com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip'
+  }
+];
+
+async function queryYtInnertubeOnRender(id) {
+  const settled = await Promise.allSettled(YT_CLIENTS.map(async c => {
+    const r = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'User-Agent': c.ua,
+        'Content-Type': 'application/json',
+        'X-YouTube-Client-Name': String(c.n),
+        'X-YouTube-Client-Version': c.ver,
+        Origin: 'https://www.youtube.com'
+      },
+      body: JSON.stringify({
+        videoId: id,
+        contentCheckOk: true,
+        racyCheckOk: true,
+        context: {
+          client: { clientName: c.name, clientVersion: c.ver, hl: 'uk', gl: 'UA', ...c.extra },
+          ...(c.thirdParty ? { thirdParty: c.thirdParty } : {})
+        }
+      })
+    }, 5000);
+    const j = await r.json().catch(() => null);
+    if (!j || !j.playabilityStatus || j.playabilityStatus.status !== 'OK') throw new Error('NOT_OK');
+    return { client: c, data: j };
+  }));
+
+  const okList = settled.filter(s => s.status === 'fulfilled' && s.value).map(s => s.value);
+  if (!okList.length) return null;
+
+  const audioTracksMap = new Map();
+  const vStreams = [];
+  const progStreams = [];
+  let hlsUrl = '';
+  let hlsUa = UA;
+  let title = '';
+  let author = '';
+
+  for (const { client: c, data: j } of okList) {
+    const vd = j.videoDetails || {};
+    if (!title && vd.title) title = String(vd.title);
+    if (!author && vd.author) author = String(vd.author);
+    const sd = j.streamingData || {};
+    if (!hlsUrl && sd.hlsManifestUrl) {
+      hlsUrl = sd.hlsManifestUrl;
+      hlsUa = c.ua;
+    }
+
+    for (const f of (Array.isArray(sd.adaptiveFormats) ? sd.adaptiveFormats : [])) {
+      if (!f || !f.url) continue;
+      const mime = String(f.mimeType || '');
+      if (/audio\/mp4/i.test(mime)) {
+        const at = f.audioTrack || {};
+        const code = normDubCode(at.id, at.displayName);
+        const br = Number(f.bitrate || 0);
+        const prev = audioTracksMap.get(code);
+        if (!prev || br > prev.bitrate) {
+          audioTracksMap.set(code, {
+            lang: code,
+            label: formatDubLabel(code, at.displayName),
+            url: f.url,
+            customUa: c.ua,
+            bitrate: br,
+            size: Number(f.contentLength) || 0,
+            isDefault: !!at.audioIsDefault
+          });
+        }
+      } else if (/video\/mp4.*avc1/i.test(mime)) {
+        const q = Number((String(f.qualityLabel || '').match(/(\d{3,4})/) || [])[1] || f.height || 0);
+        if (q > 0 && !vStreams.some(x => x.q === q)) {
+          vStreams.push({ url: f.url, q, customUa: c.ua, size: Number(f.contentLength) || 0 });
+        }
+      }
+    }
+
+    for (const f of (Array.isArray(sd.formats) ? sd.formats : [])) {
+      if (!f || !f.url || !/video\/mp4/i.test(String(f.mimeType || ''))) continue;
+      const q = Number((String(f.qualityLabel || '').match(/(\d{3,4})/) || [])[1] || f.height || 0);
+      const at = f.audioTrack || {};
+      const dubCode = at.id ? normDubCode(at.id, at.displayName) : '';
+      if (q > 0 && !progStreams.some(x => x.q === q && x.dubLang === dubCode)) {
+        progStreams.push({ url: f.url, q, dubLang: dubCode, customUa: c.ua, size: Number(f.contentLength) || 0 });
+      }
+    }
+  }
+
+  return {
+    audioTracks: [...audioTracksMap.values()],
+    vStreams,
+    progStreams,
+    hlsUrl,
+    hlsUa,
+    title,
+    author,
+    thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`
+  };
+}
+
 async function resolveYouTubeOnRender(sourceUrl, quality = '1080', dubLang = '', isAudio = false) {
   const id = extractYtId(sourceUrl);
   if (!id) throw new Error('NO_YT_ID');
   const qNum = Math.min(1080, Number(quality === 'max' ? 1080 : quality) || 720);
   const canonUrl = 'https://www.youtube.com/watch?v=' + id;
+  const targetDub = dubLang ? normDubCode(dubLang, dubLang) : '';
 
-  // 1) Спроба через внутрішній Cobalt (якщо раптом підтримує)
+  // 1) YouTube Innertube напряму з IP Render (ANDROID_VR + TVHTML5 + IOS + ANDROID) з підтримкою всіх доріжок озвучки!
   try {
-    const r = await fetch(`http://127.0.0.1:${COBALT_PORT}/`, {
-      method: 'POST',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': UA },
-      body: JSON.stringify({
-        url: canonUrl,
-        videoQuality: String(qNum),
-        downloadMode: isAudio ? 'audio' : 'auto',
-        filenameStyle: 'basic',
-        youtubeVideoCodec: 'h264',
-        ...(dubLang && dubLang !== 'orig' ? { youtubeDubLang: dubLang } : {})
-      })
-    });
-    const j = await r.json().catch(() => null);
-    if (j && j.status !== 'error') {
-      if (j.status === 'local-processing' && Array.isArray(j.tunnel) && j.tunnel.length) {
+    const inner = await queryYtInnertubeOnRender(id);
+    if (inner) {
+      const tracks = inner.audioTracks || [];
+      let chosenAudio = null;
+      if (targetDub && targetDub !== 'orig') {
+        chosenAudio = tracks.find(t => t.lang === targetDub);
+      }
+      if (!chosenAudio) {
+        chosenAudio = tracks.find(t => t.isDefault) || tracks.sort((a, b) => b.bitrate - a.bitrate)[0];
+      }
+
+      if (isAudio && chosenAudio && chosenAudio.url) {
+        return { url: chosenAudio.url, audioUrl: '', customUa: chosenAudio.customUa || UA, referer: 'https://www.youtube.com/' };
+      }
+
+      const exactAdapt = inner.vStreams.find(v => v.q === qNum) || inner.vStreams.filter(v => v.q <= qNum).sort((a, b) => b.q - a.q)[0];
+      if (exactAdapt && chosenAudio && chosenAudio.url) {
         return {
-          url: j.tunnel[0].replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
-          audioUrl: (j.tunnel[1] || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
-          customUa: UA,
-          referer: ''
+          url: exactAdapt.url,
+          audioUrl: chosenAudio.url,
+          customUa: exactAdapt.customUa || chosenAudio.customUa || UA,
+          audioUa: chosenAudio.customUa || exactAdapt.customUa || UA,
+          referer: 'https://www.youtube.com/'
         };
       }
-      const u = typeof j.url === 'string' ? j.url : (typeof j.tunnel === 'string' ? j.tunnel : '');
-      if (u) {
-        return { url: u.replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`), audioUrl: '', customUa: UA, referer: '' };
+
+      if (!targetDub || tracks.length <= 1) {
+        const bestProg = inner.progStreams.find(v => v.q === qNum) || inner.progStreams.sort((a, b) => b.q - a.q)[0];
+        if (bestProg && bestProg.url) {
+          return { url: bestProg.url, audioUrl: '', customUa: bestProg.customUa || UA, referer: 'https://www.youtube.com/' };
+        }
+      }
+
+      if (inner.hlsUrl) {
+        return { url: inner.hlsUrl, audioUrl: '', customUa: inner.hlsUa || UA, referer: 'https://www.youtube.com/' };
       }
     }
   } catch (e) {}
 
-  // 2) YouTube Innertube напряму з IP Render (ANDROID_VR, TVHTML5_SIMPLY_EMBEDDED_PLAYER, IOS, ANDROID) зі збереженням customUa!
-  const clients = [
-    {
-      n: 28,
-      name: 'ANDROID_VR',
-      ver: '1.60.19',
-      extra: { androidSdkVersion: 32, osName: 'Android', osVersion: '12L', deviceMake: 'Oculus', deviceModel: 'Quest 3' },
-      ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip'
-    },
-    {
-      n: 85,
-      name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-      ver: '2.0',
-      extra: {},
-      thirdParty: { embedUrl: 'https://www.youtube.com/' },
-      ua: 'Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15'
-    },
-    {
-      n: 5,
-      name: 'IOS',
-      ver: '19.45.4',
-      extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' },
-      ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)'
-    },
-    {
-      n: 3,
-      name: 'ANDROID',
-      ver: '19.44.38',
-      extra: { androidSdkVersion: 34, osName: 'Android', osVersion: '14' },
-      ua: 'com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip'
+  // 2) OceanSaver / Loader.to API (підтримує audio_language для дубляжу!)
+  try {
+    const fmt = isAudio ? 'mp3' : String(qNum);
+    const dubParam = targetDub && targetDub !== 'orig' ? `&audio_language=${encodeURIComponent(targetDub)}` : '';
+    const initUrl = `https://p.oceansaver.in/ajax/download.php?copyright=0&button=1&start=1&end=1&format=${fmt}${dubParam}&api=dfcb6d76f2f6a9894gjkege8a4ab232222&iframe_source=direct&url=${encodeURIComponent(canonUrl)}`;
+    const r = await fetchWithTimeout(initUrl, { headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' } }, 6000);
+    const j = await r.json().catch(() => null);
+    if (j && j.id) {
+      for (let step = 0; step < 12; step++) {
+        await new Promise(res => setTimeout(res, 1100));
+        const pr = await fetchWithTimeout(`https://p.oceansaver.in/ajax/progress.php?id=${encodeURIComponent(j.id)}`, {
+          headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' }
+        }, 5000);
+        const pj = await pr.json().catch(() => null);
+        if (pj && pj.download_url && /^https?:\/\//i.test(pj.download_url)) {
+          return { url: pj.download_url, audioUrl: '', customUa: UA, referer: 'https://p.oceansaver.in/' };
+        }
+        if (pj && pj.success === 1 && !pj.download_url) break;
+      }
     }
-  ];
-
-  for (const c of clients) {
-    try {
-      const r = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-        method: 'POST',
-        headers: {
-          'User-Agent': c.ua,
-          'Content-Type': 'application/json',
-          'X-YouTube-Client-Name': String(c.n),
-          'X-YouTube-Client-Version': c.ver,
-          Origin: 'https://www.youtube.com'
-        },
-        body: JSON.stringify({
-          videoId: id,
-          contentCheckOk: true,
-          racyCheckOk: true,
-          context: {
-            client: { clientName: c.name, clientVersion: c.ver, hl: 'uk', gl: 'UA', ...c.extra },
-            ...(c.thirdParty ? { thirdParty: c.thirdParty } : {})
-          }
-        })
-      }, 5000);
-      const j = await r.json().catch(() => null);
-      if (!j || !j.playabilityStatus || j.playabilityStatus.status !== 'OK') continue;
-      const sd = j.streamingData || {};
-      const adaptive = Array.isArray(sd.adaptiveFormats) ? sd.adaptiveFormats : [];
-      const prog = Array.isArray(sd.formats) ? sd.formats : [];
-
-      const audioStreams = adaptive.filter(f => f && f.url && /audio\/mp4/i.test(String(f.mimeType || '')));
-      let chosenAudio = null;
-      if (dubLang && dubLang !== 'orig') {
-        chosenAudio = audioStreams.find(f => f.audioTrack && String(f.audioTrack.id || '').toLowerCase().startsWith(dubLang.toLowerCase()));
-      }
-      if (!chosenAudio) {
-        chosenAudio = audioStreams.find(f => f.audioTrack && f.audioTrack.audioIsDefault) ||
-                      audioStreams.sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0))[0];
-      }
-
-      if (isAudio && chosenAudio && chosenAudio.url) {
-        return { url: chosenAudio.url, audioUrl: '', customUa: c.ua, referer: 'https://www.youtube.com/' };
-      }
-
-      const vStreams = adaptive.filter(f => f && f.url && /video\/mp4.*avc1/i.test(String(f.mimeType || ''))).map(f => ({
-        url: f.url,
-        q: Number((String(f.qualityLabel || '').match(/(\d{3,4})/) || [])[1] || f.height || 0)
-      })).filter(v => v.q > 0);
-
-      const exactAdapt = vStreams.find(v => v.q === qNum) || vStreams.filter(v => v.q <= qNum).sort((a, b) => b.q - a.q)[0];
-      if (exactAdapt && chosenAudio && chosenAudio.url) {
-        return { url: exactAdapt.url, audioUrl: chosenAudio.url, customUa: c.ua, referer: 'https://www.youtube.com/' };
-      }
-
-      const progMp4 = prog.filter(f => f && f.url && /video\/mp4/i.test(String(f.mimeType || ''))).map(f => ({
-        url: f.url,
-        q: Number((String(f.qualityLabel || '').match(/(\d{3,4})/) || [])[1] || f.height || 0)
-      }));
-      const bestProg = progMp4.find(v => v.q === qNum) || progMp4.sort((a, b) => b.q - a.q)[0];
-      if (bestProg && bestProg.url) {
-        return { url: bestProg.url, audioUrl: '', customUa: c.ua, referer: 'https://www.youtube.com/' };
-      }
-
-      if (sd.hlsManifestUrl) {
-        return { url: sd.hlsManifestUrl, audioUrl: '', customUa: c.ua, referer: 'https://www.youtube.com/' };
-      }
-    } catch (e) {}
-  }
+  } catch (e) {}
 
   // 3) SaveTube CDN API
   const stHosts = ['https://cdn59.savetube.su', 'https://cdn54.savetube.me', 'https://cdn61.savetube.su', 'https://cdn51.savetube.su'];
@@ -398,29 +500,7 @@ async function resolveYouTubeOnRender(sourceUrl, quality = '1080', dubLang = '',
     } catch (e) {}
   }
 
-  // 4) OceanSaver / Loader.to API
-  try {
-    const fmt = isAudio ? 'mp3' : String(qNum);
-    const dubParam = dubLang && dubLang !== 'orig' ? `&audio_language=${encodeURIComponent(dubLang)}` : '';
-    const initUrl = `https://p.oceansaver.in/ajax/download.php?copyright=0&button=1&start=1&end=1&format=${fmt}${dubParam}&api=dfcb6d76f2f6a9894gjkege8a4ab232222&iframe_source=direct&url=${encodeURIComponent(canonUrl)}`;
-    const r = await fetchWithTimeout(initUrl, { headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' } }, 6000);
-    const j = await r.json().catch(() => null);
-    if (j && j.id) {
-      for (let step = 0; step < 12; step++) {
-        await new Promise(res => setTimeout(res, 1100));
-        const pr = await fetchWithTimeout(`https://p.oceansaver.in/ajax/progress.php?id=${encodeURIComponent(j.id)}`, {
-          headers: { 'User-Agent': UA, Referer: 'https://p.oceansaver.in/' }
-        }, 5000);
-        const pj = await pr.json().catch(() => null);
-        if (pj && pj.download_url && /^https?:\/\//i.test(pj.download_url)) {
-          return { url: pj.download_url, audioUrl: '', customUa: UA, referer: 'https://p.oceansaver.in/' };
-        }
-        if (pj && pj.success === 1 && !pj.download_url) break;
-      }
-    }
-  } catch (e) {}
-
-  // 5) Invidious API (local=true proxy)
+  // 4) Invidious API (local=true proxy)
   const invHosts = ['https://inv.nadeko.net', 'https://invidious.nerdvpn.de', 'https://invidious.jing.rocks', 'https://yewtu.be'];
   for (const base of invHosts) {
     try {
@@ -593,7 +673,7 @@ async function handleSendMedia(body) {
     let finalPath = tmpFile('.mp4');
     filesToClean.push(finalPath);
 
-    const downloadAndMux = async (vUrl, aUrl, uaToUse, refToUse) => {
+    const downloadAndMux = async (vUrl, aUrl, uaToUse, refToUse, audioUaToUse = '') => {
       const isHls = /\.m3u8(\?|$)/i.test(vUrl);
       if (isHls) {
         await runFfmpeg([
@@ -611,7 +691,7 @@ async function handleSendMedia(body) {
         filesToClean.push(vPath, aPath);
         await Promise.all([
           downloadToFile(vUrl, vPath, refToUse, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження відео'), uaToUse),
-          downloadToFile(aUrl, aPath, refToUse, null, uaToUse)
+          downloadToFile(aUrl, aPath, refToUse, null, audioUaToUse || uaToUse)
         ]);
         await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Збірка MP4');
         await runFfmpeg([
@@ -637,7 +717,7 @@ async function handleSendMedia(body) {
       if (!sourceUrl) throw dlErr;
       // Якщо первинне посилання видало помилку (напр. 403/500), резолвимо свіжий потік за sourceUrl на IP Render!
       const fresh2 = await callInternalCobalt(sourceUrl, quality || '720', dubLang, mode === 'audio');
-      await downloadAndMux(fresh2.url, fresh2.audioUrl || '', fresh2.customUa || UA, fresh2.referer || activeRef);
+      await downloadAndMux(fresh2.url, fresh2.audioUrl || '', fresh2.customUa || UA, fresh2.referer || activeRef, fresh2.audioUa || fresh2.customUa || UA);
     }
 
     await updateProgressMsg(botToken, chatId, progressMsgId, 95, 'Відправка в Telegram');
@@ -881,24 +961,56 @@ async function handleStickersGrid(body) {
 function parseXUsername(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
-  const m = s.match(/(?:https?:\/\/)?(?:www\.|mobile\.)?(?:x|twitter|fxtwitter|vxtwitter|fixupx|xcancel)\.com\/([A-Za-z0-9_]{1,30})/i);
+  const m = s.match(/(?:https?:\/\/)?(?:www\.|mobile\.)?(?:x|twitter|fxtwitter|vxtwitter|fixupx|xcancel|nitter\.[^\/]+)\.com\/([A-Za-z0-9_]{1,30})/i) ||
+            s.match(/(?:https?:\/\/)?nitter\.[^\/]+\/([A-Za-z0-9_]{1,30})/i);
   if (m && m[1] && !/^(?:home|explore|search|i|intent|share|hashtag|status)$/i.test(m[1])) {
     return m[1];
   }
   return s.replace(/^@+/, '').split(/[\/?#\s]/)[0].trim();
 }
 
+function parseTelegramChatInput(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  const m = s.match(/(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/([A-Za-z0-9_]{4,64})/i);
+  if (m && m[1] && !/^(?:joinchat|addstickers|share|iv)$/i.test(m[1])) {
+    return '@' + m[1];
+  }
+  if (/^-?\d{6,20}$/.test(s)) return s;
+  if (s.startsWith('@')) return s;
+  if (/^[A-Za-z0-9_]{4,64}$/.test(s)) return '@' + s;
+  return s;
+}
+
 const xWatchConfig = {
-  enabled: !!(process.env.X_ACCOUNTS && process.env.X_TARGET_CHAT),
-  accounts: String(process.env.X_ACCOUNTS || '').split(',').map(parseXUsername).filter(Boolean),
-  targetChat: String(process.env.X_TARGET_CHAT || '').trim(),
+  enabled: process.env.X_ENABLED !== '0',
+  accounts: String(process.env.X_ACCOUNTS || 'GoalsXtra,TheGoalsZone').split(',').map(parseXUsername).filter(Boolean),
+  targetChat: parseTelegramChatInput(process.env.X_TARGET_CHAT || '@Fantasyargoal'),
+  autoChats: new Set(),
   botToken: String(process.env.X_POSTER_BOT_TOKEN || process.env.BOT_TOKEN || '').trim(),
+  creditText: String(process.env.X_CREDIT_TEXT || '- Uploaded by @jiijhwiazbot').trim(),
   intervalSec: Math.max(12, Number(process.env.X_INTERVAL_SEC || 15)),
   seenIds: new Set(),
   initializedAccounts: new Set(),
+  lastUpdateOffset: 0,
+  webhookClearedForToken: '',
   lastCheckAt: 0,
+  lastError: '',
   postedCount: 0
 };
+
+function isRecentValidTweetSnowflake(idStr, maxAgeHours = 72) {
+  if (!/^\d{17,21}$/.test(String(idStr || ''))) return false;
+  try {
+    const tsMs = Number((BigInt(idStr) >> 22n) + 1288834974657n);
+    const now = Date.now();
+    if (tsMs > now + 300000) return false;
+    if (now - tsMs > maxAgeHours * 3600 * 1000) return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
 function sortSnowflakesDesc(ids) {
   return [...new Set(ids)].sort((a, b) => {
@@ -908,119 +1020,240 @@ function sortSnowflakesDesc(ids) {
   });
 }
 
-async function fetchLatestVideosFromXAccount(rawInput) {
+async function fetchLatestVideosFromXAccount(rawInput, maxAgeHours = 72) {
   const cleanUser = parseXUsername(rawInput);
   if (!cleanUser) return [];
 
-  // Якщо передано пряме посилання на конкретний твіт (/status/ID)
   const directStatus = String(rawInput || '').match(/\/status(?:es)?\/(\d{15,22})/i);
   if (directStatus) return [directStatus[1]];
 
   const collected = [];
 
-  // Джерело 1: Офіційний віджет Twitter Syndication srv/timeline-profile (JSON __NEXT_DATA__)
+  // Джерело 1: Офіційний віджет Twitter Syndication srv/timeline-profile (парсинг __NEXT_DATA__ -> timeline.entries)
   try {
-    const r = await fetch(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}`, {
+    const r = await fetchWithTimeout(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}?dnt=true`, {
       headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/json,*/*' }
-    });
+    }, 6000);
     if (r.ok) {
       const html = await r.text();
-      for (const m of html.matchAll(/"id_str"\s*:\s*"(\d{15,22})"/g)) collected.push(m[1]);
-      for (const m of html.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
-      if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
+      // Витягуємо тільки ID твітів (entry_id: "tweet-..." або permalink: "/.../status/..."), щоб ніколи не плутати з user.id_str!
+      for (const m of html.matchAll(/"entry_id"\s*:\s*"tweet-(\d{17,21})"/g)) {
+        if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+      }
+      for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
+        if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+      }
     }
   } catch (e) {}
 
-  // Джерело 2: cdn.syndication.twimg.com
-  try {
-    const r = await fetch(`https://cdn.syndication.twimg.com/timeline/profile?screen_name=${encodeURIComponent(cleanUser)}&with_replies=false`, {
-      headers: { 'User-Agent': UA, Accept: 'text/html,application/json,*/*' }
-    });
-    if (r.ok) {
-      const txt = await r.text();
-      for (const m of txt.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
-      if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
-    }
-  } catch (e) {}
-
-  // Джерело 3: Jina Reader проксі для профілю X
-  try {
-    const r = await fetch(`https://r.jina.ai/https://x.com/${encodeURIComponent(cleanUser)}`, {
-      headers: { 'User-Agent': UA, Accept: 'text/plain,*/*' }
-    });
-    if (r.ok) {
-      const txt = await r.text();
-      for (const m of txt.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
-      if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
-    }
-  } catch (e) {}
-
-  // Джерело 4: Живі Nitter інстанси 2026
-  for (const host of ['https://nitter.tiekoetter.com', 'https://nitter.netbub.com', 'https://nitter.poast.org', 'https://nitter.privacydev.net']) {
+  // Джерело 2: Живий інстанс Nitter 2026 (nitter.jaydenha.uk) без JS-челенджу Anubis
+  for (const host of ['https://nitter.jaydenha.uk', 'https://nitter.tiekoetter.com', 'https://nitter.poast.org']) {
+    if (collected.length >= 4) break;
     try {
-      const r = await fetch(`${host}/${encodeURIComponent(cleanUser)}/rss`, {
-        headers: { 'User-Agent': UA, Accept: 'application/rss+xml,text/xml,*/*' }
-      });
+      const r = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}`, {
+        headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,*/*' }
+      }, 6500);
       if (r.ok) {
-        const xml = await r.text();
-        for (const m of xml.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
-        if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
+        const html = await r.text();
+        if (html.includes('timeline-item') || html.includes('/status/')) {
+          for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
+            if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+          }
+        }
       }
     } catch (e) {}
   }
 
-  return [];
+  // Джерело 3: Jina Reader проксі для профілю X
+  if (collected.length < 3) {
+    try {
+      const r = await fetchWithTimeout(`https://r.jina.ai/https://x.com/${encodeURIComponent(cleanUser)}`, {
+        headers: { 'User-Agent': UA, Accept: 'text/plain,*/*' }
+      }, 6500);
+      if (r.ok) {
+        const txt = await r.text();
+        for (const m of txt.matchAll(/\/status\/(\d{17,21})/g)) {
+          if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+        }
+      }
+    } catch (e) {}
+  }
+
+  return sortSnowflakesDesc(collected).slice(0, 8);
 }
 
 async function resolveXVideoFromTweetId(username, statusId) {
   const cleanUser = parseXUsername(username) || 'i';
+
+  // 1) FxTwitter API
   try {
-    const r = await fetch(`https://api.fxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
+    const r = await fetchWithTimeout(`https://api.fxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
       headers: { 'User-Agent': UA, Accept: 'application/json' }
-    });
+    }, 5000);
     if (r.ok) {
-      const j = await r.json();
+      const j = await r.json().catch(() => null);
       const t = j && j.tweet;
       if (t) {
         const vids = (t.media && (t.media.videos || (t.media.all && t.media.all.filter(m => m.type === 'video' || m.type === 'gif')))) || [];
         if (vids.length && vids[0].url) {
           return {
             videoUrl: vids[0].url,
-            text: String(t.text || '').replace(/https?:\/\/t\.co\/\S+/g, '').trim(),
+            text: String(t.text || '').replace(/https?:\/\/\S+/g, '').trim(),
             author: (t.author && (t.author.screen_name || t.author.name)) || cleanUser
           };
+        }
+        // Якщо пост є, але в ньому немає відео (тільки текст або фото) — одразу пропускаємо ("not all posts, only videos")
+        return null;
+      }
+    }
+  } catch (e) {}
+
+  // 2) VxTwitter API
+  try {
+    const r2 = await fetchWithTimeout(`https://api.vxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
+      headers: { 'User-Agent': UA, Accept: 'application/json' }
+    }, 5000);
+    if (r2.ok) {
+      const j2 = await r2.json().catch(() => null);
+      if (j2 && (j2.text !== undefined || j2.media_extended !== undefined)) {
+        const mediaList = Array.isArray(j2.media_extended) ? j2.media_extended : [];
+        const vid = mediaList.find(m => m && (m.type === 'video' || m.type === 'gif') && m.url);
+        if (vid) {
+          return {
+            videoUrl: vid.url,
+            text: String(j2.text || '').replace(/https?:\/\/\S+/g, '').trim(),
+            author: j2.user_screen_name || cleanUser
+          };
+        }
+        return null;
+      }
+    }
+  } catch (e) {}
+
+  // 3) Офіційний CDN Syndication tweet-result (0 лімітів!)
+  try {
+    const token = ((Number(statusId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+    const r3 = await fetchWithTimeout(`https://cdn.syndication.twimg.com/tweet-result?id=${statusId}&token=${token}&lang=en`, {
+      headers: { 'User-Agent': UA, Accept: 'application/json' }
+    }, 5000);
+    if (r3.ok) {
+      const j3 = await r3.json().catch(() => null);
+      if (j3) {
+        const details = Array.isArray(j3.mediaDetails) ? j3.mediaDetails : [];
+        for (const md of details) {
+          if (md && (md.type === 'video' || md.type === 'animated_gif') && md.video_info && Array.isArray(md.video_info.variants)) {
+            const mp4s = md.video_info.variants.filter(v => v && v.url && /video\/mp4/i.test(String(v.content_type || ''))).sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+            if (mp4s.length) {
+              return {
+                videoUrl: mp4s[0].url,
+                text: String(j3.text || '').replace(/https?:\/\/\S+/g, '').trim(),
+                author: (j3.user && j3.user.screen_name) || cleanUser
+              };
+            }
+          }
         }
       }
     }
   } catch (e) {}
 
-  try {
-    const r2 = await fetch(`https://api.vxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
-      headers: { 'User-Agent': UA, Accept: 'application/json' }
-    });
-    if (r2.ok) {
-      const j2 = await r2.json();
-      const mediaList = Array.isArray(j2 && j2.media_extended) ? j2.media_extended : [];
-      const vid = mediaList.find(m => m && (m.type === 'video' || m.type === 'gif') && m.url);
-      if (vid) {
-        return {
-          videoUrl: vid.url,
-          text: String(j2.text || '').replace(/https?:\/\/t\.co\/\S+/g, '').trim(),
-          author: j2.user_screen_name || cleanUser
-        };
-      }
-    }
-  } catch (e) {}
   return null;
 }
 
+// Автоматичне виявлення каналів та груп, куди додали бота-постера (напр. @argoalbot)
+async function discoverPartnerBotChannels() {
+  const tok = xWatchConfig.botToken;
+  if (!tok) return;
+  try {
+    const r = await fetchWithTimeout(`https://api.telegram.org/bot${tok}/getUpdates?offset=${xWatchConfig.lastUpdateOffset + 1}&limit=50&allowed_updates=${encodeURIComponent(JSON.stringify(['my_chat_member', 'channel_post', 'message']))}`, {
+      headers: { 'User-Agent': UA }
+    }, 4500);
+    const j = await r.json().catch(() => null);
+    if (!j || !j.ok || !Array.isArray(j.result)) return;
+    for (const upd of j.result) {
+      if (upd.update_id > xWatchConfig.lastUpdateOffset) {
+        xWatchConfig.lastUpdateOffset = upd.update_id;
+      }
+      const chatObj =
+        (upd.my_chat_member && upd.my_chat_member.chat) ||
+        (upd.channel_post && upd.channel_post.chat) ||
+        (upd.message && upd.message.chat);
+      const newStatus = upd.my_chat_member && upd.my_chat_member.new_chat_member && upd.my_chat_member.new_chat_member.status;
+      if (chatObj && (chatObj.type === 'channel' || chatObj.type === 'supergroup' || chatObj.type === 'group')) {
+        if (newStatus === 'kicked' || newStatus === 'left') {
+          xWatchConfig.autoChats.delete(String(chatObj.id));
+          if (chatObj.username) xWatchConfig.autoChats.delete('@' + chatObj.username);
+        } else {
+          const cid = chatObj.username ? ('@' + chatObj.username) : String(chatObj.id);
+          xWatchConfig.autoChats.add(cid);
+          if (!xWatchConfig.targetChat) xWatchConfig.targetChat = cid;
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+function getAllTargetChatsForXWatch() {
+  const list = [];
+  if (xWatchConfig.targetChat) {
+    for (const part of String(xWatchConfig.targetChat).split(/[,\s]+/)) {
+      const clean = parseTelegramChatInput(part);
+      if (clean) list.push(clean);
+    }
+  }
+  for (const c of xWatchConfig.autoChats) {
+    if (c && !list.some(x => x.toLowerCase() === String(c).toLowerCase())) {
+      list.push(c);
+    }
+  }
+  return list;
+}
+
+function formatGoalCaption(rawTweetText) {
+  const cleanText = String(rawTweetText || '')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\s+$/g, '')
+    .trim();
+  const credit = xWatchConfig.creditText || '- Uploaded by @jiijhwiazbot';
+  return cleanText ? `${cleanText}\n\n${credit}` : credit;
+}
+
+async function sendGoalVideoToChat(botToken, targetChat, videoUrl, caption) {
+  // 1) Спершу пробуємо пряму відправку URL через Telegram API
+  const sentDirect = await tgApiCall(botToken, 'sendVideo', {
+    chat_id: targetChat,
+    video: videoUrl,
+    caption,
+    supports_streaming: true
+  }, false);
+  if (sentDirect && sentDirect.ok && sentDirect.result) return sentDirect.result;
+
+  // 2) Якщо відео > 20 МБ або Telegram не зміг забрати за URL — качаємо на Render і заливаємо файлом (до 2000 МБ!)
+  const tmpVid = tmpFile('_xgoal.mp4');
+  try {
+    await downloadToFile(videoUrl, tmpVid, 'https://x.com/');
+    return await uploadMultipartToTelegram({
+      botToken,
+      chatId: targetChat,
+      mode: 'video',
+      filePath: tmpVid,
+      caption,
+      useLocalApi: localApiReady
+    });
+  } finally {
+    safeUnlink(tmpVid);
+  }
+}
+
 async function pollXAccountsOnce() {
-  if (!xWatchConfig.enabled || !xWatchConfig.accounts.length || !xWatchConfig.targetChat || !xWatchConfig.botToken) return;
+  if (!xWatchConfig.botToken) return;
+  await discoverPartnerBotChannels();
+  const targets = getAllTargetChatsForXWatch();
+  if (!xWatchConfig.enabled || !xWatchConfig.accounts.length || !targets.length) return;
   xWatchConfig.lastCheckAt = Date.now();
 
   for (const acc of xWatchConfig.accounts) {
     try {
-      const tweetIds = await fetchLatestVideosFromXAccount(acc);
+      const tweetIds = await fetchLatestVideosFromXAccount(acc, 48);
       if (!tweetIds.length) continue;
 
       if (!xWatchConfig.initializedAccounts.has(acc)) {
@@ -1034,21 +1267,22 @@ async function pollXAccountsOnce() {
         xWatchConfig.seenIds.add(tid);
 
         const media = await resolveXVideoFromTweetId(acc, tid);
+        // Тільки відео ("not all posts, only videos")!
         if (!media || !media.videoUrl) continue;
 
-        const caption = media.text ? `⚽ <b>${media.text.slice(0, 800)}</b>` : `⚽ @${acc}`;
-        const sent = await tgApiCall(xWatchConfig.botToken, 'sendVideo', {
-          chat_id: xWatchConfig.targetChat,
-          video: media.videoUrl,
-          caption,
-          parse_mode: 'HTML',
-          supports_streaming: true
-        });
-        if (sent && sent.ok) {
-          xWatchConfig.postedCount++;
+        const caption = formatGoalCaption(media.text);
+        for (const chatTarget of targets) {
+          try {
+            const res = await sendGoalVideoToChat(xWatchConfig.botToken, chatTarget, media.videoUrl, caption);
+            if (res) xWatchConfig.postedCount++;
+          } catch (sendErr) {
+            xWatchConfig.lastError = String((sendErr && sendErr.message) || sendErr).slice(0, 200);
+          }
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      xWatchConfig.lastError = String((e && e.message) || e).slice(0, 200);
+    }
   }
 }
 
@@ -1194,20 +1428,48 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'GET' && u === '/yt-info') {
+    try {
+      const qs = String(req.url || '').split('?')[1] || '';
+      const params = new URLSearchParams(qs);
+      const rawUrl = params.get('url') || '';
+      const id = extractYtId(rawUrl);
+      if (!id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'NO_YT_ID' }));
+      }
+      const info = await queryYtInnertubeOnRender(id);
+      if (!info) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'NO_INNERTUBE' }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, ...info }));
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: String(e.message || e) }));
+    }
+  }
+
   if (u === '/xwatch') {
     if (!checkAuth(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: false, error: 'UNAUTHORIZED' }));
     }
     if (req.method === 'GET') {
+      await discoverPartnerBotChannels();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
         ok: true,
         enabled: xWatchConfig.enabled,
         accounts: xWatchConfig.accounts,
-        targetChat: xWatchConfig.targetChat,
+        targetChat: getAllTargetChatsForXWatch().join(', ') || xWatchConfig.targetChat,
+        autoChats: [...xWatchConfig.autoChats],
+        hasCustomToken: !!xWatchConfig.botToken,
+        creditText: xWatchConfig.creditText,
         postedCount: xWatchConfig.postedCount,
-        lastCheckAt: xWatchConfig.lastCheckAt
+        lastCheckAt: xWatchConfig.lastCheckAt,
+        lastError: xWatchConfig.lastError
       }));
     }
     if (req.method === 'POST') {
@@ -1218,14 +1480,43 @@ const server = http.createServer(async (req, res) => {
           xWatchConfig.accounts = body.accounts.map(parseXUsername).filter(Boolean);
           xWatchConfig.initializedAccounts.clear();
         }
-        if (body.targetChat !== undefined) xWatchConfig.targetChat = String(body.targetChat || '').trim();
-        if (body.botToken) xWatchConfig.botToken = String(body.botToken).trim();
+        if (body.targetChat !== undefined) {
+          xWatchConfig.targetChat = parseTelegramChatInput(body.targetChat);
+        }
+        if (body.creditText !== undefined && String(body.creditText).trim()) {
+          xWatchConfig.creditText = String(body.creditText).trim();
+        }
+        if (body.botToken) {
+          xWatchConfig.botToken = String(body.botToken).trim();
+          await discoverPartnerBotChannels();
+        }
+        if (body.testNow) {
+          const testAcc = parseXUsername(body.testAccount || xWatchConfig.accounts[0] || 'GoalsXtra');
+          const testChat = parseTelegramChatInput(body.testChat || '') || getAllTargetChatsForXWatch()[0] || body.adminChatId;
+          const tokToUse = xWatchConfig.botToken || body.fallbackToken || '';
+          const ids = await fetchLatestVideosFromXAccount(testAcc, 240);
+          let posted = null;
+          for (const tid of ids) {
+            const media = await resolveXVideoFromTweetId(testAcc, tid);
+            if (media && media.videoUrl) {
+              const caption = formatGoalCaption(media.text);
+              const sentMsg = await sendGoalVideoToChat(tokToUse, testChat, media.videoUrl, caption);
+              if (sentMsg) {
+                posted = { account: testAcc, tweetId: tid, targetChat: testChat, caption };
+                break;
+              }
+            }
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: !!posted, posted, checkedCount: ids.length, account: testAcc, targetChat: testChat }));
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           ok: true,
           enabled: xWatchConfig.enabled,
           accounts: xWatchConfig.accounts,
-          targetChat: xWatchConfig.targetChat,
+          targetChat: getAllTargetChatsForXWatch().join(', ') || xWatchConfig.targetChat,
+          autoChats: [...xWatchConfig.autoChats],
           postedCount: xWatchConfig.postedCount
         }));
       } catch (e) {
