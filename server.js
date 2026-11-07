@@ -816,14 +816,24 @@ function checkAuth(req) {
 }
 
 function proxyToCobalt(req, res) {
+  const cleanHeaders = { ...req.headers, host: `127.0.0.1:${COBALT_PORT}` };
+  // Видаляємо заголовки проксі IP, щоб внутрішній Cobalt бачив однаковий IP (127.0.0.1)
+  // і для POST /, і для GET /tunnel (інакше Cobalt відхиляє тунель з помилкою HTTP 500!)
+  delete cleanHeaders['authorization'];
+  delete cleanHeaders['x-forwarded-for'];
+  delete cleanHeaders['cf-connecting-ip'];
+  delete cleanHeaders['true-client-ip'];
+  delete cleanHeaders['x-real-ip'];
+  delete cleanHeaders['x-client-ip'];
+  delete cleanHeaders['forwarded'];
+
   const options = {
     hostname: '127.0.0.1',
     port: COBALT_PORT,
     path: req.url,
     method: req.method,
-    headers: { ...req.headers, host: `127.0.0.1:${COBALT_PORT}` }
+    headers: cleanHeaders
   };
-  delete options.headers['authorization'];
 
   const proxyReq = http.request(options, proxyRes => {
     res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
