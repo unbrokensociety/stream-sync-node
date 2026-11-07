@@ -1011,6 +1011,16 @@ function isValidTweetSnowflake(idStr) {
   }
 }
 
+function isRecentSnowflake(idStr, maxAgeHours = 48) {
+  if (!isValidTweetSnowflake(idStr)) return false;
+  try {
+    const tsMs = Number((BigInt(idStr) >> 22n) + 1288834974657n);
+    return (Date.now() - tsMs) <= maxAgeHours * 3600 * 1000;
+  } catch (e) {
+    return false;
+  }
+}
+
 function sortSnowflakesDesc(ids) {
   return [...new Set(ids)].sort((a, b) => {
     const pa = String(a).padStart(24, '0');
@@ -1039,7 +1049,7 @@ async function resolveTcoToStatusId(tcoUrl) {
   try {
     const r = await fetchWithTimeout(tcoUrl, {
       redirect: 'manual',
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' }
+      headers: { 'User-Agent': 'TelegramBot (like TwitterBot)' }
     }, 4000);
     const loc = r.headers.get('location') || '';
     const mLoc = loc.match(/\/status(?:es)?\/(\d{17,21})/i);
@@ -1060,25 +1070,23 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
 
   const collected = [];
 
-  // Джерело 1: Офіційний віджет Twitter Syndication srv/timeline-profile (парсинг __NEXT_DATA__ -> timeline.entries)
-  try {
-    const r = await fetchWithTimeout(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}?dnt=true`, {
-      headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/json,*/*' }
-    }, 7000);
-    if (r.ok) {
-      const html = await r.text();
-      for (const m of html.matchAll(/"entry_id"\s*:\s*"tweet-(\d{17,21})"/g)) {
-        if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
+  // Джерело 1 (ПРІОРИТЕТ №1): Живі хронологічні інстанси Nitter (RSS + Профіль)
+  // Дають реальні свіжі пости за останні хвилини (1 хв тому, 12 хв тому), на відміну від syndication!
+  const nitterHosts = ['https://nitter.jaydenha.uk', 'https://nitter.tiekoetter.com', 'https://nitter.poast.org', 'https://xcancel.com'];
+  for (const host of nitterHosts) {
+    if (collected.length >= 6) break;
+    try {
+      const rRss = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}/rss`, {
+        headers: { 'User-Agent': UA, Accept: 'application/rss+xml,text/xml,text/html,*/*' }
+      }, 5500);
+      if (rRss.ok) {
+        const xml = await rRss.text();
+        for (const m of xml.matchAll(/\/status\/(\d{17,21})/g)) {
+          if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
+        }
       }
-      for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
-        if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
-      }
-    }
-  } catch (e) {}
-
-  // Джерело 2: Живі інстанси Nitter 2026 (nitter.jaydenha.uk) без JS-челенджу Anubis (таймаут 11с)
-  for (const host of ['https://nitter.jaydenha.uk', 'https://nitter.tiekoetter.com', 'https://nitter.poast.org']) {
-    if (collected.length >= 4) break;
+    } catch (e) {}
+    if (collected.length >= 6) break;
     try {
       const r = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}`, {
         headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,*/*' }
@@ -1094,6 +1102,22 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
     } catch (e) {}
   }
 
+  // Джерело 2: Офіційний віджет Twitter Syndication srv/timeline-profile — БЕРЕМО ТІЛЬКИ ПОСТИ ЗА ОСТАННІ 48 ГОДИН!
+  try {
+    const r = await fetchWithTimeout(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}?dnt=true`, {
+      headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/json,*/*' }
+    }, 6000);
+    if (r.ok) {
+      const html = await r.text();
+      for (const m of html.matchAll(/"entry_id"\s*:\s*"tweet-(\d{17,21})"/g)) {
+        if (isRecentSnowflake(m[1], 48)) collected.push(m[1]);
+      }
+      for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
+        if (isRecentSnowflake(m[1], 48)) collected.push(m[1]);
+      }
+    }
+  } catch (e) {}
+
   // Джерело 3: Веб-пошук свіжих відео-постів акаунта (pic.twitter.com / status)
   if (collected.length < 3) {
     try {
@@ -1104,7 +1128,7 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
       if (r.ok) {
         const html = await r.text();
         for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
-          if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
+          if (isRecentSnowflake(m[1], 168)) collected.push(m[1]);
         }
         const tcos = [...new Set([...html.matchAll(/(?:https?:\/\/)?t\.co\/([A-Za-z0-9]{7,12})/g)].map(m => 'https://t.co/' + m[1]))].slice(0, 5);
         const resolved = await Promise.all(tcos.map(resolveTcoToStatusId));
@@ -1115,8 +1139,8 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
     } catch (e) {}
   }
 
-  // Джерело 4: Резервні перевірені відео-посилання t.co для акаунтів під час ручного тесту
-  if (allowSeedFallback && collected.length < 2) {
+  // Джерело 4: Резервні перевірені відео-посилання t.co (тільки якщо живі джерела повернули 0)
+  if (allowSeedFallback && collected.length === 0) {
     const low = cleanUser.toLowerCase();
     const seeds = SEED_X_VIDEO_TCO[low] || SEED_X_VIDEO_TCO.goalsxtra;
     const resolved = await Promise.all(seeds.slice(0, 4).map(resolveTcoToStatusId));
@@ -1125,82 +1149,193 @@ async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false
     }
   }
 
-  return sortSnowflakesDesc(collected).slice(0, 10);
+  return sortSnowflakesDesc(collected).slice(0, 12);
 }
 
-async function resolveXVideoFromTweetId(username, statusId) {
-  const cleanUser = parseXUsername(username) || 'i';
+function pickVideoFromFxObj(tObj) {
+  if (!tObj || typeof tObj !== 'object') return '';
+  const m = tObj.media || {};
+  const vids = Array.isArray(m.videos) ? m.videos : [];
+  for (const v of vids) {
+    if (v && v.url && !/\.m3u8(\?|$)/i.test(v.url)) return v.url;
+  }
+  const all = Array.isArray(m.all) ? m.all : [];
+  for (const item of all) {
+    if (item && (item.type === 'video' || item.type === 'gif')) {
+      const u = item.url || (item.videos && item.videos[0] && item.videos[0].url);
+      if (u && !/\.m3u8(\?|$)/i.test(u)) return u;
+    }
+  }
+  if (m.external && m.external.url && /\.mp4/i.test(m.external.url)) return m.external.url;
+  return '';
+}
 
-  // 1) FxTwitter API
-  try {
-    const r = await fetchWithTimeout(`https://api.fxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
-      headers: { 'User-Agent': UA, Accept: 'application/json' }
-    }, 5000);
-    if (r.ok) {
+function pickVideoFromVxObj(vObj) {
+  if (!vObj || typeof vObj !== 'object') return '';
+  const ext = Array.isArray(vObj.media_extended) ? vObj.media_extended : [];
+  for (const m of ext) {
+    if (m && m.url && (m.type === 'video' || m.type === 'gif' || /\.mp4|video\.twimg\.com/i.test(m.url))) {
+      if (!/\.m3u8(\?|$)/i.test(m.url)) return m.url;
+    }
+  }
+  const urls = Array.isArray(vObj.mediaURLs) ? vObj.mediaURLs : [];
+  for (const u of urls) {
+    if (u && /\.mp4|video\.twimg\.com/i.test(String(u)) && !/\.m3u8(\?|$)/i.test(String(u))) return String(u);
+  }
+  return '';
+}
+
+function pickVideoFromSynObj(sObj) {
+  if (!sObj || typeof sObj !== 'object') return '';
+  const details = Array.isArray(sObj.mediaDetails) ? sObj.mediaDetails : [];
+  for (const md of details) {
+    if (md && (md.type === 'video' || md.type === 'animated_gif') && md.video_info && Array.isArray(md.video_info.variants)) {
+      const mp4s = md.video_info.variants
+        .filter(v => v && v.url && (/video\/mp4/i.test(String(v.content_type || '')) || /\.mp4/i.test(v.url)))
+        .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+      if (mp4s.length) return mp4s[0].url;
+    }
+  }
+  if (sObj.video && Array.isArray(sObj.video.variants)) {
+    const mp4s = sObj.video.variants
+      .filter(v => v && (v.src || v.url) && (/video\/mp4/i.test(String(v.type || v.content_type || '')) || /\.mp4/i.test(String(v.src || v.url))));
+    if (mp4s.length) return mp4s[mp4s.length - 1].src || mp4s[mp4s.length - 1].url;
+  }
+  return '';
+}
+
+async function resolveXVideoFromTweetId(username, statusId, depth = 0) {
+  const cleanUser = parseXUsername(username) || 'i';
+  const BOT_UA = 'TelegramBot (like TwitterBot)';
+  let mainText = '';
+  const embeddedStatusIds = [];
+  const embeddedTcos = [];
+
+  const collectEmbeddedLinks = str => {
+    const s = String(str || '');
+    for (const m of s.matchAll(/\/status(?:es)?\/(\d{17,21})/gi)) {
+      if (m[1] !== String(statusId) && isValidTweetSnowflake(m[1])) embeddedStatusIds.push(m[1]);
+    }
+    for (const m of s.matchAll(/https?:\/\/t\.co\/[A-Za-z0-9]{7,12}/gi)) {
+      embeddedTcos.push(m[0]);
+    }
+  };
+
+  // 1) FxTwitter & FixupX API (включно з Quote-твітами tw.quote та Retweet tw.retweet!)
+  for (const base of ['https://api.fxtwitter.com', 'https://api.fixupx.com']) {
+    try {
+      const r = await fetchWithTimeout(`${base}/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
+        headers: { 'User-Agent': BOT_UA, Accept: 'application/json' }
+      }, 4500);
+      if (!r.ok) continue;
       const j = await r.json().catch(() => null);
       const t = j && j.tweet;
-      if (t) {
-        const vids = (t.media && (t.media.videos || (t.media.all && t.media.all.filter(m => m.type === 'video' || m.type === 'gif')))) || [];
-        if (vids.length && vids[0].url) {
-          return {
-            videoUrl: vids[0].url,
-            text: String(t.text || '').replace(/https?:\/\/\S+/g, '').trim(),
-            author: (t.author && (t.author.screen_name || t.author.name)) || cleanUser
-          };
-        }
-        // Якщо пост є, але в ньому немає відео (тільки текст або фото) — одразу пропускаємо ("not all posts, only videos")
-        return null;
-      }
-    }
-  } catch (e) {}
+      if (!t) continue;
+      if (!mainText && t.text) mainText = String(t.text);
+      collectEmbeddedLinks(t.text);
+      if (t.raw_text && t.raw_text.text) collectEmbeddedLinks(t.raw_text.text);
 
-  // 2) VxTwitter API
-  try {
-    const r2 = await fetchWithTimeout(`https://api.vxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
-      headers: { 'User-Agent': UA, Accept: 'application/json' }
-    }, 5000);
-    if (r2.ok) {
+      const directVid = pickVideoFromFxObj(t) || pickVideoFromFxObj(t.quote) || pickVideoFromFxObj(t.retweet);
+      if (directVid) {
+        return {
+          videoUrl: directVid,
+          text: String(mainText || (t.quote && t.quote.text) || '').replace(/https?:\/\/\S+/g, '').trim(),
+          author: (t.author && (t.author.screen_name || t.author.name)) || cleanUser
+        };
+      }
+      if (t.quote && t.quote.id && String(t.quote.id) !== String(statusId)) embeddedStatusIds.push(String(t.quote.id));
+      if (t.retweet && t.retweet.id && String(t.retweet.id) !== String(statusId)) embeddedStatusIds.push(String(t.retweet.id));
+      break;
+    } catch (e) {}
+  }
+
+  // 2) VxTwitter & FixVX API (включно з mediaURLs, qrt та retweet!)
+  for (const base of ['https://api.vxtwitter.com', 'https://api.fixvx.com']) {
+    try {
+      const r2 = await fetchWithTimeout(`${base}/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
+        headers: { 'User-Agent': BOT_UA, Accept: 'application/json' }
+      }, 4500);
+      if (!r2.ok) continue;
       const j2 = await r2.json().catch(() => null);
-      if (j2 && (j2.text !== undefined || j2.media_extended !== undefined)) {
-        const mediaList = Array.isArray(j2.media_extended) ? j2.media_extended : [];
-        const vid = mediaList.find(m => m && (m.type === 'video' || m.type === 'gif') && m.url);
-        if (vid) {
-          return {
-            videoUrl: vid.url,
-            text: String(j2.text || '').replace(/https?:\/\/\S+/g, '').trim(),
-            author: j2.user_screen_name || cleanUser
-          };
-        }
-        return null;
-      }
-    }
-  } catch (e) {}
+      if (!j2) continue;
+      if (!mainText && j2.text) mainText = String(j2.text);
+      collectEmbeddedLinks(j2.text);
+      collectEmbeddedLinks(j2.qrtURL);
+      collectEmbeddedLinks(j2.retweetURL);
 
-  // 3) Офіційний CDN Syndication tweet-result (0 лімітів!)
+      const vxVid = pickVideoFromVxObj(j2) || pickVideoFromVxObj(j2.qrt) || pickVideoFromVxObj(j2.retweet);
+      if (vxVid) {
+        return {
+          videoUrl: vxVid,
+          text: String(mainText).replace(/https?:\/\/\S+/g, '').trim(),
+          author: j2.user_screen_name || cleanUser
+        };
+      }
+      break;
+    } catch (e) {}
+  }
+
+  // 3) Офіційний CDN Syndication tweet-result (mediaDetails, video.variants, quoted_tweet, parent, entities.urls)
   try {
     const token = ((Number(statusId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
     const r3 = await fetchWithTimeout(`https://cdn.syndication.twimg.com/tweet-result?id=${statusId}&token=${token}&lang=en`, {
-      headers: { 'User-Agent': UA, Accept: 'application/json' }
-    }, 5000);
+      headers: { 'User-Agent': BOT_UA, Accept: 'application/json' }
+    }, 4500);
     if (r3.ok) {
       const j3 = await r3.json().catch(() => null);
       if (j3) {
-        const details = Array.isArray(j3.mediaDetails) ? j3.mediaDetails : [];
-        for (const md of details) {
-          if (md && (md.type === 'video' || md.type === 'animated_gif') && md.video_info && Array.isArray(md.video_info.variants)) {
-            const mp4s = md.video_info.variants.filter(v => v && v.url && /video\/mp4/i.test(String(v.content_type || ''))).sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
-            if (mp4s.length) {
-              return {
-                videoUrl: mp4s[0].url,
-                text: String(j3.text || '').replace(/https?:\/\/\S+/g, '').trim(),
-                author: (j3.user && j3.user.screen_name) || cleanUser
-              };
-            }
+        if (!mainText && j3.text) mainText = String(j3.text);
+        collectEmbeddedLinks(j3.text);
+        if (j3.entities) {
+          for (const uObj of [...(j3.entities.urls || []), ...(j3.entities.media || [])]) {
+            if (uObj && uObj.expanded_url) collectEmbeddedLinks(uObj.expanded_url);
           }
+        }
+        const synVid = pickVideoFromSynObj(j3) || pickVideoFromSynObj(j3.quoted_tweet) || pickVideoFromSynObj(j3.parent) || pickVideoFromSynObj(j3.retweeted_status);
+        if (synVid) {
+          return {
+            videoUrl: synVid,
+            text: String(mainText).replace(/https?:\/\/\S+/g, '').trim(),
+            author: (j3.user && j3.user.screen_name) || cleanUser
+          };
         }
       }
     }
   } catch (e) {}
+
+  // 4) Розкриття вбудованих відео-посилань з донорських акаунтів (/status/ID/video/1 або t.co)
+  if (depth < 1) {
+    if (!embeddedStatusIds.length && embeddedTcos.length) {
+      const resolvedTcos = await Promise.all([...new Set(embeddedTcos)].slice(0, 3).map(resolveTcoToStatusId));
+      for (const rId of resolvedTcos) {
+        if (rId && rId !== String(statusId)) embeddedStatusIds.push(rId);
+      }
+    }
+    for (const subId of [...new Set(embeddedStatusIds)].slice(0, 3)) {
+      const subMedia = await resolveXVideoFromTweetId('i', subId, depth + 1);
+      if (subMedia && subMedia.videoUrl) {
+        return {
+          videoUrl: subMedia.videoUrl,
+          text: String(mainText || subMedia.text || '').replace(/https?:\/\/\S+/g, '').trim(),
+          author: cleanUser
+        };
+      }
+    }
+  }
+
+  // 5) Резерв через локальний Cobalt v10 на Render
+  if (depth === 0 && cobaltReady) {
+    try {
+      const cob = await callInternalCobalt(`https://x.com/${cleanUser}/status/${statusId}`, '1080', '', false);
+      if (cob && cob.url) {
+        return {
+          videoUrl: cob.url,
+          text: String(mainText || '').replace(/https?:\/\/\S+/g, '').trim(),
+          author: cleanUser
+        };
+      }
+    } catch (e) {}
+  }
 
   return null;
 }
@@ -1537,29 +1672,33 @@ const server = http.createServer(async (req, res) => {
           await discoverPartnerBotChannels();
         }
         if (body.testNow) {
-          const testAcc = parseXUsername(body.testAccount || xWatchConfig.accounts[0] || 'GoalsXtra');
+          const accountsToTest = body.testAccount
+            ? [parseXUsername(body.testAccount)].filter(Boolean)
+            : (xWatchConfig.accounts.length ? xWatchConfig.accounts : ['GoalsXtra', 'TheGoalsZone']);
           const testChat = parseTelegramChatInput(body.testChat || '') || getAllTargetChatsForXWatch()[0] || body.adminChatId;
           const tokToUse = xWatchConfig.botToken || body.fallbackToken || '';
-          const ids = await fetchLatestVideosFromXAccount(testAcc, true);
-          let posted = null;
-          for (const tid of ids) {
-            const media = await resolveXVideoFromTweetId(testAcc, tid);
-            if (media && media.videoUrl) {
-              const caption = formatGoalCaption(media.text);
-              let actualTarget = testChat;
-              let sentMsg = await sendGoalVideoToChat(tokToUse, testChat, media.videoUrl, caption).catch(() => null);
-              if (!sentMsg && body.adminChatId && String(body.adminChatId) !== String(testChat)) {
-                actualTarget = body.adminChatId;
-                sentMsg = await sendGoalVideoToChat(tokToUse, body.adminChatId, media.videoUrl, caption).catch(() => null);
-              }
-              if (sentMsg) {
-                posted = { account: testAcc, tweetId: tid, targetChat: actualTarget, caption };
-                break;
+          const postedList = [];
+          for (const testAcc of accountsToTest) {
+            const ids = await fetchLatestVideosFromXAccount(testAcc, true);
+            for (const tid of ids) {
+              const media = await resolveXVideoFromTweetId(testAcc, tid);
+              if (media && media.videoUrl) {
+                const caption = formatGoalCaption(media.text);
+                let actualTarget = testChat;
+                let sentMsg = await sendGoalVideoToChat(tokToUse, testChat, media.videoUrl, caption).catch(() => null);
+                if (!sentMsg && body.adminChatId && String(body.adminChatId) !== String(testChat)) {
+                  actualTarget = body.adminChatId;
+                  sentMsg = await sendGoalVideoToChat(tokToUse, body.adminChatId, media.videoUrl, caption).catch(() => null);
+                }
+                if (sentMsg) {
+                  postedList.push({ account: testAcc, tweetId: tid, targetChat: actualTarget, caption });
+                  break;
+                }
               }
             }
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ ok: !!posted, posted, checkedCount: ids.length, account: testAcc, targetChat: testChat }));
+          return res.end(JSON.stringify({ ok: postedList.length > 0, posted: postedList[0] || null, postedList, targetChat: testChat }));
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
