@@ -84,7 +84,16 @@ function startLocalBotApi() {
     return;
   }
 
+  // КРИТИЧНО: На Render /tmp монтується як чистий tmpfs під час старту контейнера,
+  // тому обов'язково створюємо /tmp/tgbotapi та /tmp/tgbotapi-tmp у рантаймі перед запуском бінарника
+  // (інакше td::realpath() у telegram-bot-api падає з помилкою No such file or directory та кодом 1!)
+  try {
+    fs.mkdirSync('/tmp/tgbotapi', { recursive: true, mode: 0o755 });
+    fs.mkdirSync('/tmp/tgbotapi-tmp', { recursive: true, mode: 0o755 });
+  } catch (e) {}
+
   let exited = false;
+  let firstErrorLine = '';
   const proc = spawn(bin, [
     '--local',
     '--http-port=' + LOCAL_API_PORT,
@@ -92,12 +101,23 @@ function startLocalBotApi() {
     '--api-hash=' + RAW_API_HASH,
     '--dir=/tmp/tgbotapi',
     '--temp-dir=/tmp/tgbotapi-tmp'
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  ], {
+    env: {
+      ...process.env,
+      TELEGRAM_API_ID: RAW_API_ID,
+      TELEGRAM_API_HASH: RAW_API_HASH
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
 
   proc.stdout.on('data', d => process.stdout.write('[tgbotapi] ' + d.toString()));
   proc.stderr.on('data', d => {
     const s = d.toString();
-    localApiLastError = s.trim().slice(-240);
+    const lines = s.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (lines.length && !firstErrorLine) {
+      firstErrorLine = lines[0];
+    }
+    localApiLastError = (firstErrorLine || s.trim()).slice(0, 240);
     process.stderr.write('[tgbotapi] ' + s);
   });
   proc.on('exit', code => {
