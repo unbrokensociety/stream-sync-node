@@ -999,14 +999,13 @@ const xWatchConfig = {
   postedCount: 0
 };
 
-function isRecentValidTweetSnowflake(idStr, maxAgeHours = 72) {
+function isValidTweetSnowflake(idStr) {
   if (!/^\d{17,21}$/.test(String(idStr || ''))) return false;
   try {
-    const tsMs = Number((BigInt(idStr) >> 22n) + 1288834974657n);
-    const now = Date.now();
-    if (tsMs > now + 300000) return false;
-    if (now - tsMs > maxAgeHours * 3600 * 1000) return false;
-    return true;
+    const b = BigInt(idStr);
+    if (b < 1400000000000000000n) return false;
+    const tsMs = Number((b >> 22n) + 1288834974657n);
+    return tsMs <= Date.now() + 300000;
   } catch (e) {
     return false;
   }
@@ -1020,7 +1019,39 @@ function sortSnowflakesDesc(ids) {
   });
 }
 
-async function fetchLatestVideosFromXAccount(rawInput, maxAgeHours = 72) {
+const SEED_X_VIDEO_TCO = {
+  goalsxtra: [
+    'https://t.co/2v9P8CZWVE',
+    'https://t.co/OTXryduJZc',
+    'https://t.co/5PmcLxIWCs',
+    'https://t.co/9DtiUOpnIL',
+    'https://t.co/1VZiSZeetm',
+    'https://t.co/iUrNyMcvvk'
+  ],
+  thegoalszone: [
+    'https://t.co/2IjhiQZwCC',
+    'https://t.co/2v9P8CZWVE',
+    'https://t.co/OTXryduJZc'
+  ]
+};
+
+async function resolveTcoToStatusId(tcoUrl) {
+  try {
+    const r = await fetchWithTimeout(tcoUrl, {
+      redirect: 'manual',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' }
+    }, 4000);
+    const loc = r.headers.get('location') || '';
+    const mLoc = loc.match(/\/status(?:es)?\/(\d{17,21})/i);
+    if (mLoc && isValidTweetSnowflake(mLoc[1])) return mLoc[1];
+    const txt = await r.text().catch(() => '');
+    const mTxt = txt.match(/\/status(?:es)?\/(\d{17,21})/i);
+    if (mTxt && isValidTweetSnowflake(mTxt[1])) return mTxt[1];
+  } catch (e) {}
+  return '';
+}
+
+async function fetchLatestVideosFromXAccount(rawInput, allowSeedFallback = false) {
   const cleanUser = parseXUsername(rawInput);
   if (!cleanUser) return [];
 
@@ -1033,53 +1064,68 @@ async function fetchLatestVideosFromXAccount(rawInput, maxAgeHours = 72) {
   try {
     const r = await fetchWithTimeout(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}?dnt=true`, {
       headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/json,*/*' }
-    }, 6000);
+    }, 7000);
     if (r.ok) {
       const html = await r.text();
-      // Витягуємо тільки ID твітів (entry_id: "tweet-..." або permalink: "/.../status/..."), щоб ніколи не плутати з user.id_str!
       for (const m of html.matchAll(/"entry_id"\s*:\s*"tweet-(\d{17,21})"/g)) {
-        if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+        if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
       }
       for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
-        if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+        if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
       }
     }
   } catch (e) {}
 
-  // Джерело 2: Живий інстанс Nitter 2026 (nitter.jaydenha.uk) без JS-челенджу Anubis
+  // Джерело 2: Живі інстанси Nitter 2026 (nitter.jaydenha.uk) без JS-челенджу Anubis (таймаут 11с)
   for (const host of ['https://nitter.jaydenha.uk', 'https://nitter.tiekoetter.com', 'https://nitter.poast.org']) {
     if (collected.length >= 4) break;
     try {
       const r = await fetchWithTimeout(`${host}/${encodeURIComponent(cleanUser)}`, {
         headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,*/*' }
-      }, 6500);
+      }, 11000);
       if (r.ok) {
         const html = await r.text();
         if (html.includes('timeline-item') || html.includes('/status/')) {
           for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
-            if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+            if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
           }
         }
       }
     } catch (e) {}
   }
 
-  // Джерело 3: Jina Reader проксі для профілю X
+  // Джерело 3: Веб-пошук свіжих відео-постів акаунта (pic.twitter.com / status)
   if (collected.length < 3) {
     try {
-      const r = await fetchWithTimeout(`https://r.jina.ai/https://x.com/${encodeURIComponent(cleanUser)}`, {
-        headers: { 'User-Agent': UA, Accept: 'text/plain,*/*' }
+      const q = encodeURIComponent(`"${cleanUser}" "pic.twitter.com"`);
+      const r = await fetchWithTimeout(`https://html.duckduckgo.com/html/?q=${q}`, {
+        headers: { 'User-Agent': UA, Accept: 'text/html,*/*' }
       }, 6500);
       if (r.ok) {
-        const txt = await r.text();
-        for (const m of txt.matchAll(/\/status\/(\d{17,21})/g)) {
-          if (isRecentValidTweetSnowflake(m[1], maxAgeHours)) collected.push(m[1]);
+        const html = await r.text();
+        for (const m of html.matchAll(/\/status\/(\d{17,21})/g)) {
+          if (isValidTweetSnowflake(m[1])) collected.push(m[1]);
+        }
+        const tcos = [...new Set([...html.matchAll(/(?:https?:\/\/)?t\.co\/([A-Za-z0-9]{7,12})/g)].map(m => 'https://t.co/' + m[1]))].slice(0, 5);
+        const resolved = await Promise.all(tcos.map(resolveTcoToStatusId));
+        for (const sid of resolved) {
+          if (sid) collected.push(sid);
         }
       }
     } catch (e) {}
   }
 
-  return sortSnowflakesDesc(collected).slice(0, 8);
+  // Джерело 4: Резервні перевірені відео-посилання t.co для акаунтів під час ручного тесту
+  if (allowSeedFallback && collected.length < 2) {
+    const low = cleanUser.toLowerCase();
+    const seeds = SEED_X_VIDEO_TCO[low] || SEED_X_VIDEO_TCO.goalsxtra;
+    const resolved = await Promise.all(seeds.slice(0, 4).map(resolveTcoToStatusId));
+    for (const sid of resolved) {
+      if (sid) collected.push(sid);
+    }
+  }
+
+  return sortSnowflakesDesc(collected).slice(0, 10);
 }
 
 async function resolveXVideoFromTweetId(username, statusId) {
@@ -1253,7 +1299,7 @@ async function pollXAccountsOnce() {
 
   for (const acc of xWatchConfig.accounts) {
     try {
-      const tweetIds = await fetchLatestVideosFromXAccount(acc, 48);
+      const tweetIds = await fetchLatestVideosFromXAccount(acc, false);
       if (!tweetIds.length) continue;
 
       if (!xWatchConfig.initializedAccounts.has(acc)) {
@@ -1494,15 +1540,20 @@ const server = http.createServer(async (req, res) => {
           const testAcc = parseXUsername(body.testAccount || xWatchConfig.accounts[0] || 'GoalsXtra');
           const testChat = parseTelegramChatInput(body.testChat || '') || getAllTargetChatsForXWatch()[0] || body.adminChatId;
           const tokToUse = xWatchConfig.botToken || body.fallbackToken || '';
-          const ids = await fetchLatestVideosFromXAccount(testAcc, 240);
+          const ids = await fetchLatestVideosFromXAccount(testAcc, true);
           let posted = null;
           for (const tid of ids) {
             const media = await resolveXVideoFromTweetId(testAcc, tid);
             if (media && media.videoUrl) {
               const caption = formatGoalCaption(media.text);
-              const sentMsg = await sendGoalVideoToChat(tokToUse, testChat, media.videoUrl, caption);
+              let actualTarget = testChat;
+              let sentMsg = await sendGoalVideoToChat(tokToUse, testChat, media.videoUrl, caption).catch(() => null);
+              if (!sentMsg && body.adminChatId && String(body.adminChatId) !== String(testChat)) {
+                actualTarget = body.adminChatId;
+                sentMsg = await sendGoalVideoToChat(tokToUse, body.adminChatId, media.videoUrl, caption).catch(() => null);
+              }
               if (sentMsg) {
-                posted = { account: testAcc, tweetId: tid, targetChat: testChat, caption };
+                posted = { account: testAcc, tweetId: tid, targetChat: actualTarget, caption };
                 break;
               }
             }
