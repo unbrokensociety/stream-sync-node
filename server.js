@@ -17,8 +17,8 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const MB = 1024 * 1024;
 const STD_TG_LIMIT = Math.floor(49.2 * MB);
 
-let cobaltReady = false;
-let localApiReady = false;
+let cobaltReady = true;
+let localApiReady = Boolean( process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH );
 let localApiLastError = '';
 
 // Очищення та перевірка TELEGRAM_API_ID і TELEGRAM_API_HASH
@@ -456,29 +456,37 @@ async function handleCircle(body) {
       dlUrl = `https://api.telegram.org/file/bot${botToken}/${fp}`;
     }
 
-    await updateProgressMsg(botToken, chatId, progressMsgId, 35, 'Завантаження відео');
-    await downloadToFile(dlUrl, inPath);
-
-    await updateProgressMsg(botToken, chatId, progressMsgId, 70, 'Конвертація у кружечок (FFmpeg)');
-    await runFfmpeg([
-      '-i', inPath,
+    await updateProgressMsg(botToken, chatId, progressMsgId, 55, 'Швидка обрізка у кружечок');
+    const ffArgs = srcInput => [
+      '-threads', '0',
+      '-i', srcInput,
       '-t', '60',
-      '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480,setsar=1",
+      '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=384:384,setsar=1",
+      '-r', '30',
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
       '-profile:v', 'baseline',
       '-level', '3.0',
       '-pix_fmt', 'yuv420p',
-      '-crf', '24',
+      '-crf', '25',
       '-c:a', 'aac',
       '-ac', '1',
       '-ar', '44100',
       '-b:a', '96k',
       '-movflags', '+faststart',
       '-y', outPath
-    ], 60000);
+    ];
 
-    await updateProgressMsg(botToken, chatId, progressMsgId, 94, 'Відправка кружечка');
+    try {
+      // Потокова конвертація напряму з URL в один прохід (без очікування подвійного запису на диск!)
+      await runFfmpeg(ffArgs(dlUrl), 45000);
+    } catch (e) {
+      await downloadToFile(dlUrl, inPath);
+      await runFfmpeg(ffArgs(inPath), 45000);
+    }
+
+    await updateProgressMsg(botToken, chatId, progressMsgId, 92, 'Відправка кружечка');
     const result = await uploadMultipartToTelegram({
       botToken,
       chatId,
@@ -487,7 +495,7 @@ async function handleCircle(body) {
       replyMarkup,
       replyToMsgId,
       businessConnectionId,
-      useLocalApi: false
+      useLocalApi: localApiReady
     });
     return { ok: true, result };
   } finally {
