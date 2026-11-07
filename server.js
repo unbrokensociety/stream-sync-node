@@ -15,10 +15,17 @@ const PUBLIC_URL = String(process.env.RENDER_EXTERNAL_URL || process.env.API_URL
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const MB = 1024 * 1024;
-const STD_TG_LIMIT = Math.floor(49.4 * MB);
+const STD_TG_LIMIT = Math.floor(49.2 * MB);
 
 let cobaltReady = false;
 let localApiReady = false;
+let localApiLastError = '';
+
+// Очищення та перевірка TELEGRAM_API_ID і TELEGRAM_API_HASH
+const RAW_API_ID = String(process.env.TELEGRAM_API_ID || '').replace(/['"\s]+/g, '');
+const RAW_API_HASH = String(process.env.TELEGRAM_API_HASH || '').replace(/['"\s]+/g, '');
+const API_ID_VALID = /^\d{5,12}$/.test(RAW_API_ID);
+const API_HASH_VALID = /^[0-9a-fA-F]{32}$/.test(RAW_API_HASH);
 
 // ==================== 1. ЗАПУСК COBALT V10 ВНУТРІ КОНТЕЙНЕРА ====================
 function startCobalt() {
@@ -57,30 +64,57 @@ function startCobalt() {
 
 // ==================== 2. ЗАПУСК TELEGRAM LOCAL BOT API (ДО 2000 МБ) ====================
 function startLocalBotApi() {
-  const apiId = String(process.env.TELEGRAM_API_ID || '').trim();
-  const apiHash = String(process.env.TELEGRAM_API_HASH || '').trim();
   const bin = '/usr/local/bin/telegram-bot-api';
-  if (!apiId || !apiHash || !fs.existsSync(bin)) {
-    console.log('[local-bot-api] TELEGRAM_API_ID / TELEGRAM_API_HASH not set — using standard api.telegram.org + FFmpeg auto-fit');
+  if (!RAW_API_ID || !RAW_API_HASH) {
+    localApiLastError = 'TELEGRAM_API_ID or TELEGRAM_API_HASH is empty';
     return;
   }
+  if (!API_ID_VALID) {
+    localApiLastError = `Invalid TELEGRAM_API_ID (${RAW_API_ID.slice(0, 4)}...): must be 5-12 digits from my.telegram.org`;
+    console.error('[tgbotapi]', localApiLastError);
+    return;
+  }
+  if (!API_HASH_VALID) {
+    localApiLastError = `Invalid TELEGRAM_API_HASH (len=${RAW_API_HASH.length}): must be 32 hex chars (0-9, a-f) from my.telegram.org`;
+    console.error('[tgbotapi]', localApiLastError);
+    return;
+  }
+  if (!fs.existsSync(bin)) {
+    localApiLastError = 'Binary /usr/local/bin/telegram-bot-api not found';
+    return;
+  }
+
+  let exited = false;
   const proc = spawn(bin, [
     '--local',
     '--http-port=' + LOCAL_API_PORT,
-    '--api-id=' + apiId,
-    '--api-hash=' + apiHash,
+    '--api-id=' + RAW_API_ID,
+    '--api-hash=' + RAW_API_HASH,
     '--dir=/tmp/tgbotapi',
     '--temp-dir=/tmp/tgbotapi-tmp'
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
   proc.stdout.on('data', d => process.stdout.write('[tgbotapi] ' + d.toString()));
-  proc.stderr.on('data', d => process.stderr.write('[tgbotapi] ' + d.toString()));
-  proc.on('exit', code => {
-    localApiReady = false;
-    console.warn('[tgbotapi] exited with code', code, '— restarting in 5s');
-    setTimeout(startLocalBotApi, 5000);
+  proc.stderr.on('data', d => {
+    const s = d.toString();
+    localApiLastError = s.trim().slice(-240);
+    process.stderr.write('[tgbotapi] ' + s);
   });
-  setTimeout(() => { localApiReady = true; }, 2500);
+  proc.on('exit', code => {
+    exited = true;
+    localApiReady = false;
+    console.warn('[tgbotapi] exited with code', code);
+    if (code !== 0) {
+      localApiLastError = `Exited with code ${code}: ${localApiLastError}`;
+    }
+  });
+  setTimeout(() => {
+    if (!exited) {
+      localApiReady = true;
+      localApiLastError = '';
+      console.log('[tgbotapi] Running on port ' + LOCAL_API_PORT + ' (up to 2000 MB limit active)');
+    }
+  }, 2500);
 }
 
 // ==================== 3. ДОПОМІЖНІ ФУНКЦІЇ ====================
@@ -108,6 +142,23 @@ function runFfmpeg(args, timeoutMs = 120000) {
       if (code === 0) resolve(true);
       else reject(new Error('ffmpeg exit ' + code + ': ' + errOut.slice(-300)));
     });
+  });
+}
+
+function probeVideoDimensions(filePath) {
+  return new Promise(resolve => {
+    const p = spawn('ffmpeg', ['-hide_banner', '-i', filePath]);
+    let out = '';
+    p.stderr.on('data', d => { out += d.toString(); });
+    p.on('close', () => {
+      const m = out.match(/Stream #0:\d+.*Video:.*?\s(\d{2,5})x(\d{2,5})\b/);
+      const dur = out.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      const width = m ? Number(m[1]) : 1080;
+      const height = m ? Number(m[2]) : 1920;
+      const duration = dur ? (Number(dur[1]) * 3600 + Number(dur[2]) * 60 + parseFloat(dur[3])) : 3;
+      resolve({ width, height, duration });
+    });
+    p.on('error', () => resolve({ width: 1080, height: 1920, duration: 3 }));
   });
 }
 
@@ -166,22 +217,27 @@ async function downloadToFile(url, destPath, referer = '', onPct = null) {
 }
 
 async function callInternalCobalt(sourceUrl, quality = 'max') {
+  const isYt = /youtube\.com|youtu\.be/i.test(String(sourceUrl));
   const r = await fetch(`http://127.0.0.1:${COBALT_PORT}/`, {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': UA },
     body: JSON.stringify({
       url: sourceUrl,
-      videoQuality: String(quality || 'max'),
+      videoQuality: isYt ? String(quality === 'max' ? '1080' : (quality || '1080')) : String(quality || 'max'),
       downloadMode: 'auto',
       filenameStyle: 'basic',
-      allowH265: true,
-      tiktokFullAudio: true
+      allowH265: !isYt,
+      tiktokFullAudio: true,
+      ...(isYt ? { youtubeVideoCodec: 'h264' } : {})
     })
   });
   const j = await r.json().catch(() => null);
   if (!j || j.status === 'error') throw new Error('COBALT_ERR');
   if (j.status === 'local-processing' && Array.isArray(j.tunnel) && j.tunnel.length) {
-    return { url: j.tunnel[0], audioUrl: j.tunnel[1] || '' };
+    return {
+      url: j.tunnel[0].replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`),
+      audioUrl: (j.tunnel[1] || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`)
+    };
   }
   const u = typeof j.url === 'string' ? j.url : (typeof j.tunnel === 'string' ? j.tunnel : '');
   if (!u) throw new Error('NO_COBALT_URL');
@@ -189,28 +245,35 @@ async function callInternalCobalt(sourceUrl, quality = 'max') {
 }
 
 async function uploadMultipartToTelegram({
-  botToken, chatId, mode, filePath, caption, replyMarkup, replyToMsgId, businessConnectionId, useLocalApi
+  botToken, chatId, mode, filePath, fileNameOverride = '', caption, replyMarkup, replyToMsgId, businessConnectionId, useLocalApi
 }) {
   const stat = fs.statSync(filePath);
   const method = mode === 'document' ? 'sendDocument' : mode === 'audio' ? 'sendAudio' : mode === 'video_note' ? 'sendVideoNote' : 'sendVideo';
   const field = mode === 'document' ? 'document' : mode === 'audio' ? 'audio' : mode === 'video_note' ? 'video_note' : 'video';
-  const fileName = mode === 'audio' ? 'audio.mp3' : mode === 'video_note' ? 'circle.mp4' : 'video.mp4';
+  const fileName = fileNameOverride || (mode === 'audio' ? 'audio.mp3' : mode === 'video_note' ? 'circle.mp4' : 'video.mp4');
   const mime = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
 
-  // Якщо запущений Local Bot API і переданий прапорець useLocalApi — можна передати локальний шлях file:// напряму (до 2000 МБ за 0.1 сек!)
+  // 1) Спроба через Local Bot API (до 2000 МБ за 0.1 сек через локальний шлях file://)
   if (useLocalApi && localApiReady) {
-    const payload = {
-      chat_id: chatId,
-      [field]: 'file://' + filePath,
-      ...(caption && mode !== 'video_note' ? { caption, parse_mode: 'HTML' } : {}),
-      ...(mode === 'video' ? { supports_streaming: true, show_caption_above_media: true } : {}),
-      ...(mode === 'video_note' ? { length: 480 } : {}),
-      ...(replyToMsgId ? { reply_parameters: { message_id: Number(replyToMsgId), allow_sending_without_reply: true } } : {}),
-      ...(businessConnectionId ? { business_connection_id: businessConnectionId } : {}),
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
-    };
-    const jLocal = await tgApiCall(botToken, method, payload, true);
-    if (jLocal && jLocal.ok && jLocal.result) return jLocal.result;
+    try {
+      const payload = {
+        chat_id: chatId,
+        [field]: 'file://' + filePath,
+        ...(caption && mode !== 'video_note' ? { caption, parse_mode: 'HTML' } : {}),
+        ...(mode === 'video' ? { supports_streaming: true, show_caption_above_media: true } : {}),
+        ...(mode === 'video_note' ? { length: 480 } : {}),
+        ...(replyToMsgId ? { reply_parameters: { message_id: Number(replyToMsgId), allow_sending_without_reply: true } } : {}),
+        ...(businessConnectionId ? { business_connection_id: businessConnectionId } : {}),
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+      };
+      const jLocal = await tgApiCall(botToken, method, payload, true);
+      if (jLocal && jLocal.ok && jLocal.result) return jLocal.result;
+    } catch (e) {}
+  }
+
+  // 2) Стандартний multipart upload на api.telegram.org (до 50 МБ)
+  if (stat.size > STD_TG_LIMIT) {
+    throw new Error('FILE_OVER_50MB_NEED_FIT');
   }
 
   const form = new FormData();
@@ -250,13 +313,14 @@ async function uploadMultipartToTelegram({
   return j.result;
 }
 
-// ==================== 4. ОБРОБНИК /send (ВІДЕО >20 МБ, СКЛЕЙКА 1080p YOUTUBE, HLS, АВТО-СПЛІТ) ====================
+// ==================== 4. ОБРОБНИК /send (ВІДЕО >20 МБ ТА ДО 2 ГБ, СКЛЕЙКА 1080p, АВТО-СПЛІТ/ФІТ) ====================
 async function handleSendMedia(body) {
   const {
     botToken, chatId, mode = 'video', url, audioUrl = '', sourceUrl = '', tunnelUsed = false,
-    referer = '', caption = '', replyMarkup = null, replyToMsgId = null, businessConnectionId = null,
-    progressMsgId = null
+    referer = '', caption = '', replyMarkup = null, replyToMsgId = null, replyToMessageId = null,
+    businessConnectionId = null, progressMsgId = null
   } = body || {};
+  const rplId = replyToMsgId || replyToMessageId || null;
 
   if (!botToken || !chatId || (!url && !sourceUrl)) {
     throw new Error('MISSING_PARAMS');
@@ -275,7 +339,7 @@ async function handleSendMedia(body) {
 
   const filesToClean = [];
   try {
-    await updateProgressMsg(botToken, chatId, progressMsgId, 30, 'Завантаження на сервер');
+    await updateProgressMsg(botToken, chatId, progressMsgId, 30, 'Завантаження');
 
     let finalPath = tmpFile('.mp4');
     filesToClean.push(finalPath);
@@ -299,7 +363,7 @@ async function handleSendMedia(body) {
         downloadToFile(targetUrl, vPath, referer, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження 1080p')),
         downloadToFile(targetAudio, aPath, referer)
       ]);
-      await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Склейка відео та звуку (FFmpeg)');
+      await updateProgressMsg(botToken, chatId, progressMsgId, 88, 'Збірка MP4');
       await runFfmpeg([
         '-i', vPath,
         '-i', aPath,
@@ -315,44 +379,56 @@ async function handleSendMedia(body) {
       await downloadToFile(targetUrl, finalPath, referer, p => updateProgressMsg(botToken, chatId, progressMsgId, p, 'Завантаження'));
     }
 
-    const stat = fs.statSync(finalPath);
-    // Якщо файл > 49.4 МБ і ми працюємо через стандартний api.telegram.org — робимо швидке стиснення або спліт через FFmpeg
-    if (stat.size > STD_TG_LIMIT && !localApiReady) {
-      await updateProgressMsg(botToken, chatId, progressMsgId, 90, 'Оптимізація розміру під ліміт ТГ');
+    await updateProgressMsg(botToken, chatId, progressMsgId, 95, 'Відправка в Telegram');
+
+    // Спершу пробуємо відправити оригінал (якщо запущений Local Bot API — пройде до 2000 МБ!)
+    try {
+      const result = await uploadMultipartToTelegram({
+        botToken,
+        chatId,
+        mode,
+        filePath: finalPath,
+        caption,
+        replyMarkup,
+        replyToMsgId: rplId,
+        businessConnectionId,
+        useLocalApi: localApiReady
+      });
+      return { ok: true, result };
+    } catch (uploadErr) {
+      // Якщо файл > 50 МБ і бот працює через хмарний api.telegram.org — автоматично стискаємо під 49 МБ через FFmpeg!
+      const stat = fs.statSync(finalPath);
+      if (stat.size <= STD_TG_LIMIT) throw uploadErr;
+
+      await updateProgressMsg(botToken, chatId, progressMsgId, 91, 'Оптимізація розміру (>50 МБ)');
       const compPath = tmpFile('_fit.mp4');
       filesToClean.push(compPath);
-      try {
-        await runFfmpeg([
-          '-i', finalPath,
-          '-vf', "scale='min(1280,iw)':-2",
-          '-c:v', 'libx264',
-          '-preset', 'ultrafast',
-          '-crf', '27',
-          '-c:a', 'aac',
-          '-b:a', '128k',
-          '-fs', String(STD_TG_LIMIT),
-          '-movflags', '+faststart',
-          '-y', compPath
-        ], 90000);
-        if (fs.existsSync(compPath) && fs.statSync(compPath).size > 1024 && fs.statSync(compPath).size <= STD_TG_LIMIT) {
-          finalPath = compPath;
-        }
-      } catch (e) {}
-    }
+      await runFfmpeg([
+        '-i', finalPath,
+        '-vf', "scale='min(1280,iw)':-2",
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '27',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-fs', String(STD_TG_LIMIT),
+        '-movflags', '+faststart',
+        '-y', compPath
+      ], 110000);
 
-    await updateProgressMsg(botToken, chatId, progressMsgId, 95, 'Відправка в Telegram');
-    const result = await uploadMultipartToTelegram({
-      botToken,
-      chatId,
-      mode,
-      filePath: finalPath,
-      caption,
-      replyMarkup,
-      replyToMsgId,
-      businessConnectionId,
-      useLocalApi: localApiReady && !!process.env.USE_LOCAL_BOT_API
-    });
-    return { ok: true, result };
+      const result = await uploadMultipartToTelegram({
+        botToken,
+        chatId,
+        mode,
+        filePath: compPath,
+        caption,
+        replyMarkup,
+        replyToMsgId: rplId,
+        businessConnectionId,
+        useLocalApi: false
+      });
+      return { ok: true, result };
+    }
   } finally {
     filesToClean.forEach(safeUnlink);
   }
@@ -420,10 +496,122 @@ async function handleCircle(body) {
   }
 }
 
-// ==================== 6. АВТОПАРСЕР X (TWITTER) ДЛЯ ФУТБОЛЬНИХ ГОЛІВ (КОЖНІ 15 СЕК) ====================
+// ==================== 6. НАРІЗКА ВІДЕО НА КВАДРАТИКИ ДЛЯ СТІКЕРІВ ПРОФІЛЮ (/stickers) ====================
+async function handleStickersGrid(body) {
+  const {
+    botToken, chatId, url = '', sourceUrl = '', fileId = '', cols = 3, rows = 3,
+    replyToMsgId = null, progressMsgId = null
+  } = body || {};
+
+  if (!botToken || !chatId || (!url && !sourceUrl && !fileId)) {
+    throw new Error('MISSING_STICKERS_PARAMS');
+  }
+
+  const gridCols = Math.max(1, Math.min(5, Number(cols) || 3));
+  const gridRows = Math.max(1, Math.min(5, Number(rows) || 3));
+  const filesToClean = [];
+
+  try {
+    const inPath = tmpFile('_grid_in.mp4');
+    filesToClean.push(inPath);
+
+    let dlUrl = String(url || '').replace(PUBLIC_URL, `http://127.0.0.1:${COBALT_PORT}`);
+    if (!dlUrl && fileId) {
+      const gf = await tgApiCall(botToken, 'getFile', { file_id: fileId });
+      const fp = gf && gf.ok && gf.result && gf.result.file_path;
+      if (!fp) throw new Error('GET_FILE_FAILED');
+      dlUrl = `https://api.telegram.org/file/bot${botToken}/${fp}`;
+    }
+    if (!dlUrl && sourceUrl) {
+      const c = await callInternalCobalt(sourceUrl, 'max');
+      dlUrl = c.url;
+    }
+
+    await updateProgressMsg(botToken, chatId, progressMsgId, 25, 'Завантаження оригіналу');
+    await downloadToFile(dlUrl, inPath);
+
+    const { width, height, duration } = await probeVideoDimensions(inPath);
+    // Обчислюємо область сітки квадратиків по центру кадру (відрізаючи чорні смуги TikTok зверху і знизу)
+    const maxTileW = Math.floor(width / gridCols);
+    const maxTileH = Math.floor(height / gridRows);
+    const tileSize = Math.max(64, Math.min(maxTileW, maxTileH));
+    const gridW = tileSize * gridCols;
+    const gridH = tileSize * gridRows;
+    const startX = Math.max(0, Math.floor((width - gridW) / 2));
+    const startY = Math.max(0, Math.floor((height - gridH) / 2));
+    // Прибираємо 2% рамки всередині кожної клітинки, щоб лінії сітки з TikTok не потрапляли на стікер
+    const inset = Math.max(2, Math.round(tileSize * 0.02));
+    const cropSize = Math.max(32, tileSize - inset * 2);
+    const clipDur = Math.min(duration || 3, 2.95).toFixed(2);
+
+    const totalTiles = gridCols * gridRows;
+    const outPaths = [];
+
+    for (let r = 0; r < gridRows; r++) {
+      for (let c = 0; c < gridCols; c++) {
+        const idx = r * gridCols + c + 1;
+        const pct = Math.round(30 + (idx / totalTiles) * 55);
+        await updateProgressMsg(botToken, chatId, progressMsgId, pct, `Нарізка квадратика ${idx}/${totalTiles}`);
+        const cellX = startX + c * tileSize + inset;
+        const cellY = startY + r * tileSize + inset;
+        const tilePath = tmpFile(`_sticker_${idx}.mp4`);
+        filesToClean.push(tilePath);
+
+        await runFfmpeg([
+          '-i', inPath,
+          '-t', clipDur,
+          '-vf', `crop=${cropSize}:${cropSize}:${cellX}:${cellY},scale=512:512,setsar=1`,
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-crf', '18',
+          '-pix_fmt', 'yuv420p',
+          '-an',
+          '-movflags', '+faststart',
+          '-y', tilePath
+        ], 45000);
+
+        outPaths.push({ path: tilePath, name: `sticker_${r + 1}_${c + 1}_(${idx}).mp4` });
+      }
+    }
+
+    await updateProgressMsg(botToken, chatId, progressMsgId, 92, 'Відправка готових файлів');
+    const sentResults = [];
+    for (let i = 0; i < outPaths.length; i++) {
+      const item = outPaths[i];
+      const cap = i === 0 ? `🧩 <b>Нарізка ${gridCols}×${gridRows} (${outPaths.length} ч. · 512×512 без втрати якості)</b>` : '';
+      const sent = await uploadMultipartToTelegram({
+        botToken,
+        chatId,
+        mode: 'document',
+        filePath: item.path,
+        fileNameOverride: item.name,
+        caption: cap,
+        replyToMsgId: i === 0 ? replyToMsgId : null,
+        useLocalApi: false
+      });
+      if (sent) sentResults.push(sent);
+    }
+
+    return { ok: true, count: sentResults.length, result: sentResults[0] || true };
+  } finally {
+    filesToClean.forEach(safeUnlink);
+  }
+}
+
+// ==================== 7. АВТОПАРСЕР X (TWITTER) ДЛЯ ФУТБОЛЬНИХ ГОЛІВ (КОЖНІ 15 СЕК) ====================
+function parseXUsername(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  const m = s.match(/(?:https?:\/\/)?(?:www\.|mobile\.)?(?:x|twitter|fxtwitter|vxtwitter|fixupx|xcancel)\.com\/([A-Za-z0-9_]{1,30})/i);
+  if (m && m[1] && !/^(?:home|explore|search|i|intent|share|hashtag|status)$/i.test(m[1])) {
+    return m[1];
+  }
+  return s.replace(/^@+/, '').split(/[\/?#\s]/)[0].trim();
+}
+
 const xWatchConfig = {
   enabled: !!(process.env.X_ACCOUNTS && process.env.X_TARGET_CHAT),
-  accounts: String(process.env.X_ACCOUNTS || '').split(',').map(s => s.trim().replace(/^@/, '')).filter(Boolean),
+  accounts: String(process.env.X_ACCOUNTS || '').split(',').map(parseXUsername).filter(Boolean),
   targetChat: String(process.env.X_TARGET_CHAT || '').trim(),
   botToken: String(process.env.X_POSTER_BOT_TOKEN || process.env.BOT_TOKEN || '').trim(),
   intervalSec: Math.max(12, Number(process.env.X_INTERVAL_SEC || 15)),
@@ -433,57 +621,118 @@ const xWatchConfig = {
   postedCount: 0
 };
 
-async function fetchLatestVideosFromXAccount(username) {
-  const cleanUser = String(username || '').replace(/^@/, '').trim();
+function sortSnowflakesDesc(ids) {
+  return [...new Set(ids)].sort((a, b) => {
+    const pa = String(a).padStart(24, '0');
+    const pb = String(b).padStart(24, '0');
+    return pb.localeCompare(pa);
+  });
+}
+
+async function fetchLatestVideosFromXAccount(rawInput) {
+  const cleanUser = parseXUsername(rawInput);
   if (!cleanUser) return [];
 
-  // Джерело 1: Twitter Syndication Timeline (безкоштовно, віддає останні твіти профілю у JSON/HTML)
+  // Якщо передано пряме посилання на конкретний твіт (/status/ID)
+  const directStatus = String(rawInput || '').match(/\/status(?:es)?\/(\d{15,22})/i);
+  if (directStatus) return [directStatus[1]];
+
+  const collected = [];
+
+  // Джерело 1: Офіційний віджет Twitter Syndication srv/timeline-profile (JSON __NEXT_DATA__)
   try {
-    const r = await fetch(`https://cdn.syndication.twimg.com/timeline/profile?screen_name=${encodeURIComponent(cleanUser)}&with_replies=false`, {
+    const r = await fetch(`https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(cleanUser)}`, {
       headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/json,*/*' }
     });
     if (r.ok) {
-      const txt = await r.text();
-      const ids = [...new Set([...txt.matchAll(/\/status\/(\d{15,22})/g)].map(m => m[1]))].slice(0, 4);
-      if (ids.length) return ids;
+      const html = await r.text();
+      for (const m of html.matchAll(/"id_str"\s*:\s*"(\d{15,22})"/g)) collected.push(m[1]);
+      for (const m of html.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
+      if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
     }
   } catch (e) {}
 
-  // Джерело 2: Nitter / XCancel RSS резерв
-  for (const host of ['https://xcancel.com', 'https://nitter.poast.org', 'https://nitter.privacydev.net']) {
+  // Джерело 2: cdn.syndication.twimg.com
+  try {
+    const r = await fetch(`https://cdn.syndication.twimg.com/timeline/profile?screen_name=${encodeURIComponent(cleanUser)}&with_replies=false`, {
+      headers: { 'User-Agent': UA, Accept: 'text/html,application/json,*/*' }
+    });
+    if (r.ok) {
+      const txt = await r.text();
+      for (const m of txt.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
+      if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
+    }
+  } catch (e) {}
+
+  // Джерело 3: Jina Reader проксі для профілю X
+  try {
+    const r = await fetch(`https://r.jina.ai/https://x.com/${encodeURIComponent(cleanUser)}`, {
+      headers: { 'User-Agent': UA, Accept: 'text/plain,*/*' }
+    });
+    if (r.ok) {
+      const txt = await r.text();
+      for (const m of txt.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
+      if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
+    }
+  } catch (e) {}
+
+  // Джерело 4: Живі Nitter інстанси 2026
+  for (const host of ['https://nitter.tiekoetter.com', 'https://nitter.netbub.com', 'https://nitter.poast.org', 'https://nitter.privacydev.net']) {
     try {
       const r = await fetch(`${host}/${encodeURIComponent(cleanUser)}/rss`, {
         headers: { 'User-Agent': UA, Accept: 'application/rss+xml,text/xml,*/*' }
       });
       if (r.ok) {
         const xml = await r.text();
-        const ids = [...new Set([...xml.matchAll(/\/status\/(\d{15,22})/g)].map(m => m[1]))].slice(0, 4);
-        if (ids.length) return ids;
+        for (const m of xml.matchAll(/\/status\/(\d{15,22})/g)) collected.push(m[1]);
+        if (collected.length) return sortSnowflakesDesc(collected).slice(0, 6);
       }
     } catch (e) {}
   }
+
   return [];
 }
 
 async function resolveXVideoFromTweetId(username, statusId) {
+  const cleanUser = parseXUsername(username) || 'i';
   try {
-    const r = await fetch(`https://api.fxtwitter.com/${encodeURIComponent(username)}/status/${statusId}`, {
+    const r = await fetch(`https://api.fxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
       headers: { 'User-Agent': UA, Accept: 'application/json' }
     });
-    if (!r.ok) return null;
-    const j = await r.json();
-    const t = j && j.tweet;
-    if (!t) return null;
-    const vids = (t.media && (t.media.videos || (t.media.all && t.media.all.filter(m => m.type === 'video' || m.type === 'gif')))) || [];
-    if (!vids.length) return null;
-    return {
-      videoUrl: vids[0].url,
-      text: String(t.text || '').replace(/https?:\/\/t\.co\/\S+/g, '').trim(),
-      author: (t.author && (t.author.name || t.author.screen_name)) || username
-    };
-  } catch (e) {
-    return null;
-  }
+    if (r.ok) {
+      const j = await r.json();
+      const t = j && j.tweet;
+      if (t) {
+        const vids = (t.media && (t.media.videos || (t.media.all && t.media.all.filter(m => m.type === 'video' || m.type === 'gif')))) || [];
+        if (vids.length && vids[0].url) {
+          return {
+            videoUrl: vids[0].url,
+            text: String(t.text || '').replace(/https?:\/\/t\.co\/\S+/g, '').trim(),
+            author: (t.author && (t.author.screen_name || t.author.name)) || cleanUser
+          };
+        }
+      }
+    }
+  } catch (e) {}
+
+  try {
+    const r2 = await fetch(`https://api.vxtwitter.com/${encodeURIComponent(cleanUser)}/status/${statusId}`, {
+      headers: { 'User-Agent': UA, Accept: 'application/json' }
+    });
+    if (r2.ok) {
+      const j2 = await r2.json();
+      const mediaList = Array.isArray(j2 && j2.media_extended) ? j2.media_extended : [];
+      const vid = mediaList.find(m => m && (m.type === 'video' || m.type === 'gif') && m.url);
+      if (vid) {
+        return {
+          videoUrl: vid.url,
+          text: String(j2.text || '').replace(/https?:\/\/t\.co\/\S+/g, '').trim(),
+          author: j2.user_screen_name || cleanUser
+        };
+      }
+    }
+  } catch (e) {}
+  return null;
 }
 
 async function pollXAccountsOnce() {
@@ -495,14 +744,13 @@ async function pollXAccountsOnce() {
       const tweetIds = await fetchLatestVideosFromXAccount(acc);
       if (!tweetIds.length) continue;
 
-      // При першому запуску запам'ятовуємо поточні твіти, щоб не дублювати старі відео
       if (!xWatchConfig.initializedAccounts.has(acc)) {
         tweetIds.forEach(id => xWatchConfig.seenIds.add(id));
         xWatchConfig.initializedAccounts.add(acc);
         continue;
       }
 
-      for (const tid of tweetIds.reverse()) {
+      for (const tid of [...tweetIds].reverse()) {
         if (xWatchConfig.seenIds.has(tid)) continue;
         xWatchConfig.seenIds.add(tid);
 
@@ -536,7 +784,7 @@ setInterval(() => {
   }
 }, 8 * 60 * 1000);
 
-// ==================== 7. HTTP СЕРВЕР ТА ПРОКСІ НА ВНУТРІШНІЙ COBALT ====================
+// ==================== 8. HTTP СЕРВЕР ТА ПРОКСІ НА ВНУТРІШНІЙ COBALT ====================
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -601,6 +849,15 @@ const server = http.createServer(async (req, res) => {
       cobaltReady,
       ffmpeg: true,
       localBotApi: localApiReady,
+      localBotApiDiagnostics: {
+        apiIdProvided: !!RAW_API_ID,
+        apiIdValid: API_ID_VALID,
+        apiIdPreview: RAW_API_ID ? (RAW_API_ID.slice(0, 2) + '***' + RAW_API_ID.slice(-2)) : '',
+        apiHashProvided: !!RAW_API_HASH,
+        apiHashValid: API_HASH_VALID,
+        apiHashLength: RAW_API_HASH.length,
+        lastError: localApiLastError
+      },
       xWatcher: {
         enabled: xWatchConfig.enabled,
         accounts: xWatchConfig.accounts,
@@ -636,6 +893,18 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'POST' && u === '/stickers') {
+    try {
+      const body = await readJsonBody(req);
+      const out = await handleStickersGrid(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(out));
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) }));
+    }
+  }
+
   if (u === '/xwatch') {
     if (!checkAuth(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -657,7 +926,7 @@ const server = http.createServer(async (req, res) => {
         const body = await readJsonBody(req);
         if (typeof body.enabled === 'boolean') xWatchConfig.enabled = body.enabled;
         if (Array.isArray(body.accounts)) {
-          xWatchConfig.accounts = body.accounts.map(s => String(s).trim().replace(/^@/, '')).filter(Boolean);
+          xWatchConfig.accounts = body.accounts.map(parseXUsername).filter(Boolean);
           xWatchConfig.initializedAccounts.clear();
         }
         if (body.targetChat !== undefined) xWatchConfig.targetChat = String(body.targetChat || '').trim();
@@ -677,11 +946,10 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Захист POST / (Cobalt API) ключем, щоб сторонні не навантажували твій сервер
   if (req.method === 'POST' && (u === '/' || u === '/api/json')) {
     if (!checkAuth(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ status: 'error', error: { code: ' error.api.auth.key.missing' } }));
+      return res.end(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }));
     }
   }
 
@@ -692,5 +960,5 @@ startCobalt();
 startLocalBotApi();
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[stream-sync-node] Gateway + Cobalt + FFmpeg + X-Watcher listening on port ${PORT} (public: ${PUBLIC_URL})`);
+  console.log(`[stream-sync-node] Gateway + Cobalt + FFmpeg + Stickers + X-Watcher listening on port ${PORT} (public: ${PUBLIC_URL})`);
 });
