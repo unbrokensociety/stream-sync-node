@@ -189,16 +189,18 @@ const SEEN_CAP = 150;
 const state = {
   loadedFromTelegram: false,   // true якщо стан підтягнуто з Telegram або отримано явний push від бота
   x: {
+    schema: 5,
     enabled: envBool('X_ENABLED', true),
     accounts: uniq(parseList(env('X_ACCOUNTS', 'GoalsXtra,TheGoalsZone')).map(parseXUsername).filter(Boolean)),
     targets: uniq(parseList(env('X_TARGET_CHAT', '@Fantasyargoal')).map(parseTelegramChat).filter(Boolean)),
     autoChats: [],
     credit: env('X_CREDIT_TEXT', '- Uploaded by @jiijhwiazbot'),
     token: env('X_POSTER_BOT_TOKEN'),
-    holdEnabled: envBool('X_HOLD_ENABLED', true), // За замовчуванням: кидати в відложку на 1 день (24 год) для перевірки на повтори
+    holdEnabled: envBool('X_HOLD_ENABLED', true), // Відложка на 1 день (schedule_date) ТІЛЬКИ для підозри на повтор
     holdHours: envNum('X_HOLD_HOURS', 24),
-    queue: [],         // Черга відкладених постів (відложка на 24 год): [{ qid, account, id, videoUrl, width, height, duration, text, createdAt, publishAt, targets, dupWarning, adminChatId, adminMsgId, cachedFileId }]
-    mediaSeen: [],     // Глобальні ключі вже взятих відео (щоб другий акаунт не дублював те саме відео)
+    scheduledDups: 0,  // Скільки підозрілих на повтор відео відправлено у відложку каналу (schedule_date)
+    mediaSeen: [],     // Ключі вже опублікованих відео [{ key, acc, id, at }]
+    recentMeta: [],    // Метадані нещодавно опублікованих постів для розумного виявлення повторів [{ acc, id, text, duration, at }]
     seen: {},          // lc(account) -> [id, ...] (нові спочатку)
     baseline: {},      // lc(account) -> timestamp останнього стартового поста
     offset: 0,         // getUpdates offset для виявлення каналів
@@ -237,11 +239,12 @@ function serializeState() {
     v: 1,
     savedAt: Date.now(),
     x: {
+      schema: 5,
       enabled: x.enabled, accounts: x.accounts, targets: x.targets, autoChats: x.autoChats,
       credit: x.credit, token: encSecret(x.token),
-      holdEnabled: x.holdEnabled, holdHours: x.holdHours,
-      queue: Array.isArray(x.queue) ? x.queue.slice(0, 120) : [],
-      mediaSeen: Array.isArray(x.mediaSeen) ? x.mediaSeen.slice(0, 400) : [],
+      holdEnabled: x.holdEnabled, holdHours: x.holdHours, scheduledDups: x.scheduledDups || 0,
+      mediaSeen: Array.isArray(x.mediaSeen) ? x.mediaSeen.slice(0, 300) : [],
+      recentMeta: Array.isArray(x.recentMeta) ? x.recentMeta.slice(0, 150) : [],
       seen: x.seen, baseline: x.baseline,
       offset: x.offset, posted: x.posted, updatedAt: x.updatedAt
     }
@@ -268,16 +271,15 @@ function applyLoadedState(j) {
   }
   if (typeof x.holdEnabled === 'boolean') S.holdEnabled = x.holdEnabled;
   if (Number.isFinite(x.holdHours) && x.holdHours >= 0) S.holdHours = x.holdHours;
-  if (Array.isArray(x.queue)) {
-    const existingIds = new Set((S.queue || []).map(q => q.qid));
-    for (const q of x.queue) {
-      if (q && q.qid && !existingIds.has(q.qid)) S.queue.push(q);
+  if (Number.isFinite(x.scheduledDups)) S.scheduledDups = x.scheduledDups;
+  if (Array.isArray(x.mediaSeen)) S.mediaSeen = x.mediaSeen.slice(0, 300);
+  if (Array.isArray(x.recentMeta)) S.recentMeta = x.recentMeta.slice(0, 150);
+  // Якщо завантажено старий стан (до схеми v5), де для 2-го акаунта міг залипнути порожній baseline — очищаємо залиплі baseline
+  if (x.schema === 5 && x.baseline && typeof x.baseline === 'object') {
+    for (const k of Object.keys(x.baseline)) {
+      if ((S.seen[k] || []).length > 0) S.baseline[k] = x.baseline[k];
     }
   }
-  if (Array.isArray(x.mediaSeen)) {
-    S.mediaSeen = uniq([...(S.mediaSeen || []), ...x.mediaSeen]).slice(0, 400);
-  }
-  if (x.baseline && typeof x.baseline === 'object') S.baseline = { ...S.baseline, ...x.baseline };
   if (Number.isFinite(x.offset)) S.offset = x.offset;
   if (Number.isFinite(x.posted)) S.posted = x.posted;
   S.updatedAt = Number(x.updatedAt) || 0;
@@ -502,6 +504,7 @@ async function sendFileToTelegram(p) {
   const mkForm = () => {
     const f = new FormData();
     f.append('chat_id', String(chatId));
+    if (p.scheduleDate && Number(p.scheduleDate) > 0) f.append('schedule_date', String(Math.floor(Number(p.scheduleDate))));
     if (threadId) f.append('message_thread_id', String(threadId));
     if (bizConn) f.append('business_connection_id', String(bizConn));
     if (replyTo) f.append('reply_parameters', JSON.stringify({ message_id: Number(replyTo), allow_sending_without_reply: true }));
@@ -530,6 +533,7 @@ async function sendFileToTelegram(p) {
 
   const mkJsonLocal = () => {
     const o = { chat_id: chatId, [M.field]: 'file://' + file };
+    if (p.scheduleDate && Number(p.scheduleDate) > 0) o.schedule_date = Math.floor(Number(p.scheduleDate));
     if (threadId) o.message_thread_id = Number(threadId);
     if (bizConn) o.business_connection_id = String(bizConn);
     if (replyTo) o.reply_parameters = { message_id: Number(replyTo), allow_sending_without_reply: true };
@@ -1660,7 +1664,7 @@ async function handleDiag(rawUrl, quality = 720) {
   return { ok: true, platform: req.platform, ms: Date.now() - t0, engines: job.diag, ytdlp: ytdlpVersion || null, cobalt: cobaltReady };
 }
 
-// ==================== 13. X-ВОТЧЕР (відео-пости акаунтів → Telegram-канали + Відложка на 1 день) ====================
+// ==================== 13. X-ВОТЧЕР (відео-пости акаунтів → Telegram-канали, schedule_date для повторів) ====================
 const X = state.x;
 const X_INTERVAL_SEC = Math.max(envNum('X_MIN_INTERVAL_SEC', 5), envNum('X_INTERVAL_SEC', 8));
 const X_MAX_AGE_MS = envNum('X_MAX_AGE_HOURS', 18) * 3600 * 1000;
@@ -1670,9 +1674,9 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const xr = {                       // стан виконання (не зберігається)
   lastTickAt: 0, lastOkAt: 0, lastError: '', phase: 'init', ticks: 0, rrIndex: 0,
   perAccount: {}, targetStatus: {}, discoverError: '', lastDiscoverAt: 0, lastVerifyAt: 0, botId: 0, botName: '',
-  tries: {}, noVideoTries: {}, resolvedCache: new Map(), recentPostsMeta: [], test: null, diag: null
+  tries: {}, noVideoTries: {}, resolvedCache: new Map(), scheduledMediaKeys: new Set(), test: null, diag: null
 };
-const srcStats = {};       // глобальна статистика по джерелах для панелі
+const srcStats = {};       // глобальна статистика по джерелах
 const accSrcCooldown = {}; // окремий кулдаун acc:src, щоб збій на 1-му акаунті НІКОЛИ не блокував 2-й акаунт!
 
 const TW_EPOCH = 1288834974657n;
@@ -1696,75 +1700,135 @@ function srcFail(name, e, acc = '') {
   const s = stat(name);
   s.fail++; s.consec++;
   s.lastErr = redact(String((e && e.message) || e)).slice(0, 140);
-  const cd = Date.now() + Math.min(45000, 5000 * Math.pow(1.5, Math.min(s.consec - 1, 4)));
+  const cd = Date.now() + Math.min(35000, 4000 * Math.pow(1.5, Math.min(s.consec - 1, 4)));
   s.cooldownUntil = cd;
   if (acc) accSrcCooldown[accCooldownKey(acc, name)] = cd;
 }
 
-// Виділяє унікальний глобальний ключ відео з URL або ID донора (щоб 2 акаунти не постили одне й те саме відео двічі)
+// ---- ДЕТЕКТОР ПІДОЗРИ НА ПОВТОР (між 1-м, 2-м та всіма акаунтами) ----
+// Унікальний ключ відеофайлу або донорського твіта
 function videoMediaKey(url, donorId = '') {
   if (donorId && isSnowflake(donorId)) return 'donor:' + donorId;
   const s = String(url || '');
   const m = s.match(/(?:amplify_video|ext_tw_video|tweet_video)\/(\d{10,22})/i) ||
-            s.match(/\/([\w-]{12,64})\.mp4/i);
+            s.match(/\/([\w-]{12,64})\.(?:mp4|m3u8)/i);
   return m ? ('vid:' + m[1]) : ('url:' + s.split('?')[0].slice(-80));
 }
 
-function hasGlobalMediaSeen(mKey) {
-  if (!mKey) return false;
-  if (Array.isArray(X.mediaSeen) && X.mediaSeen.includes(mKey)) return true;
-  if (Array.isArray(X.queue) && X.queue.some(q => q && q.mediaKey === mKey)) return true;
-  return false;
-}
-
-function markGlobalMediaSeen(mKey) {
-  if (!mKey) return;
-  if (!Array.isArray(X.mediaSeen)) X.mediaSeen = [];
-  if (!X.mediaSeen.includes(mKey)) {
-    X.mediaSeen.unshift(mKey);
-    if (X.mediaSeen.length > 400) X.mediaSeen = X.mediaSeen.slice(0, 400);
-  }
-}
-
-// Розумна перевірка на схожість тексту/матчу (щоб попереджати людину у відложці про можливий повтор гола з іншого ракурсу)
-function tokenizeMatchText(text) {
-  const clean = String(text || '')
+function normalizeTextForDup(raw) {
+  return String(raw || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, ' ')
     .replace(/pic\.twitter\.com\/\S+/g, ' ')
+    .replace(/@[a-z0-9_]+/g, ' ')
     .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  const stop = new Set(['goal', 'gol', 'golazo', 'what', 'the', 'and', 'for', 'from', 'with', 'assist', 'match', 'live', 'video', 'uploaded', 'by']);
+}
+
+function tokenizeMatchText(text) {
+  const clean = normalizeTextForDup(text);
+  const stop = new Set([
+    'goal', 'gol', 'golazo', 'what', 'the', 'and', 'for', 'from', 'with',
+    'assist', 'match', 'live', 'video', 'uploaded', 'great', 'amazing',
+    'scores', 'scored', 'lead', 'equalizer', 'winner', 'penalty', 'free', 'kick'
+  ]);
   return uniq(clean.split(' ').filter(w => w.length >= 3 && !stop.has(w)));
 }
 
-function findSimilarRecentPost(text, currentAcc, currentId) {
-  const wordsA = tokenizeMatchText(text);
-  if (wordsA.length < 2) return null;
-  const setA = new Set(wordsA);
-  const pool = [
-    ...(Array.isArray(X.queue) ? X.queue.map(q => ({ id: q.id, acc: q.account, text: q.text, at: q.createdAt, inQueue: true })) : []),
-    ...xr.recentPostsMeta
-  ];
-  for (const item of pool) {
-    if (!item || String(item.id) === String(currentId)) continue;
-    if (Date.now() - (item.at || 0) > 6 * 3600 * 1000) continue;
-    const wordsB = tokenizeMatchText(item.text);
-    if (wordsB.length < 2) continue;
+function extractScoreSignature(text) {
+  const m = String(text || '').match(/\b(\d)\s*[-:]\s*(\d)\b/);
+  return m ? (m[1] + '-' + m[2]) : '';
+}
+
+// Перевіряє, чи є нове відео підозрілим на повтор вже опублікованого раніше поста:
+// Повертає null (якщо відео унікальне -> публікуємо ОДРАЗУ) або об'єкт { reason, prevAcc, prevId, exactTwice } (якщо є підозра на повтор -> кидаємо у відложку schedule_date на 1 день!)
+function checkDuplicateSuspicion(item, acc) {
+  const mKey = videoMediaKey(item.videoUrl, item.donorId);
+  const mediaList = Array.isArray(X.mediaSeen) ? X.mediaSeen : [];
+  const metaList = Array.isArray(X.recentMeta) ? X.recentMeta : [];
+
+  // 1. Точний збіг відеофайлу або донорського твіта (наприклад, @TheGoalsZone репостить той самий кліп, що вже вийшов у @GoalsXtra)
+  const exactHit = mediaList.find(x => x && (typeof x === 'string' ? x === mKey : x.key === mKey));
+  if (exactHit) {
+    const alreadyScheduled = xr.scheduledMediaKeys.has(mKey);
+    return {
+      isDup: true,
+      exactTwice: alreadyScheduled, // якщо цей же точний файл ВЖЕ кидали у відложку вдруге — втретє не спамимо
+      mKey,
+      reason: 'exact-video',
+      prevAcc: (typeof exactHit === 'object' && exactHit.acc) || 'іншого акаунта'
+    };
+  }
+
+  // 2. Схожий текст / той самий гол або рахунок матчу за останні 12 годин
+  const wordsA = tokenizeMatchText(item.text);
+  const scoreA = extractScoreSignature(item.text);
+  const durA = Number(item.duration) || 0;
+  const now = Date.now();
+
+  for (const prev of metaList) {
+    if (!prev || String(prev.id) === String(item.id)) continue;
+    const ageMs = now - (prev.at || 0);
+    if (ageMs > 12 * 3600 * 1000) continue;
+
+    const wordsB = tokenizeMatchText(prev.text);
+    const scoreB = extractScoreSignature(prev.text);
     let common = 0;
+    const setA = new Set(wordsA);
     for (const w of wordsB) if (setA.has(w)) common++;
-    const ratio = common / Math.min(wordsA.length, wordsB.length);
-    if (common >= 3 || (common >= 2 && ratio >= 0.65)) {
-      return { acc: item.acc, id: item.id, inQueue: !!item.inQueue, text: String(item.text || '').slice(0, 80) };
+
+    // Якщо збігаються хоча б 2 ключові слова (команди/гравець) + однаковий рахунок (наприклад 1-0), або ≥3 ключові слова, або високий відсоток збігу
+    if (wordsA.length >= 2 && wordsB.length >= 2) {
+      const ratio = common / Math.min(wordsA.length, wordsB.length);
+      const sameScore = scoreA && scoreB && scoreA === scoreB;
+      if ((common >= 2 && sameScore) || common >= 3 || (common >= 2 && ratio >= 0.6)) {
+        return {
+          isDup: true,
+          exactTwice: false,
+          mKey,
+          reason: 'similar-match',
+          prevAcc: prev.acc || acc
+        };
+      }
+    }
+
+    // 3. Якщо обидва пости без тексту (або з 1 словом) вийшли з різницею менше 4 хвилин у різних акаунтах і мають майже однакову тривалість відео (±1.5 с)
+    if (wordsA.length <= 1 && wordsB.length <= 1 && lc(prev.acc) !== lc(acc) && ageMs < 4 * 60 * 1000) {
+      const durB = Number(prev.duration) || 0;
+      if (durA > 3 && durB > 3 && Math.abs(durA - durB) <= 1.5) {
+        return {
+          isDup: true,
+          exactTwice: false,
+          mKey,
+          reason: 'same-duration-burst',
+          prevAcc: prev.acc
+        };
+      }
     }
   }
+
   return null;
 }
 
-function rememberPostMeta(acc, id, text) {
-  xr.recentPostsMeta.unshift({ acc, id, text: String(text || '').slice(0, 200), at: Date.now() });
-  if (xr.recentPostsMeta.length > 150) xr.recentPostsMeta.length = 150;
+function recordPublishedVideo(item, acc) {
+  const mKey = videoMediaKey(item.videoUrl, item.donorId);
+  if (!Array.isArray(X.mediaSeen)) X.mediaSeen = [];
+  if (!X.mediaSeen.some(x => (typeof x === 'string' ? x : x.key) === mKey)) {
+    X.mediaSeen.unshift({ key: mKey, acc, id: String(item.id), at: Date.now() });
+    if (X.mediaSeen.length > 300) X.mediaSeen.length = 300;
+  }
+  if (!Array.isArray(X.recentMeta)) X.recentMeta = [];
+  X.recentMeta.unshift({
+    acc,
+    id: String(item.id),
+    text: String(item.text || '').slice(0, 220),
+    duration: Number(item.duration) || 0,
+    at: Date.now()
+  });
+  if (X.recentMeta.length > 150) X.recentMeta.length = 150;
 }
 
 // ---- вибір найкращого MP4 з відповідей різних сервісів ----
@@ -1778,7 +1842,7 @@ function pickFxVideo(v) {
   const good = fastDirect || pool.find(f => (!f.size || f.size <= 48 * MB) && (!f.height || f.height <= 1080));
   const best = good || pool[0] || pool[pool.length - 1];
   if (best) return { url: best.url, width: best.width || v.width, height: best.height || v.height, duration: v.duration || (v.duration_ms ? v.duration_ms / 1000 : 0) };
-  if (v.url && !/\.m3u8(\?|$)/i.test(v.url)) return { url: v.url, width: v.width, height: v.height, duration: v.duration || (v.duration_ms ? v.duration_ms / 1000 : 0) };
+  if (v.url) return { url: v.url, width: v.width, height: v.height, duration: v.duration || (v.duration_ms ? v.duration_ms / 1000 : 0) };
   return null;
 }
 
@@ -1801,7 +1865,7 @@ function extractFxTweetDirectVideo(o) {
       }
     }
   }
-  if (m.external && m.external.url && /\.mp4(\?|$)/i.test(m.external.url)) {
+  if (m.external && m.external.url && /\.(?:mp4|m3u8)(\?|$)/i.test(m.external.url)) {
     return { url: m.external.url, width: m.external.width, height: m.external.height, duration: m.external.duration };
   }
   return null;
@@ -1853,7 +1917,9 @@ function extractTweetEmbeddedLinks(t, selfId = '') {
   return { statusIds: uniq(statusIds), tcoUrls: uniq(tcoUrls) };
 }
 
-function itemsFromFxV2(j, includeCandidates = true) {
+// ВАЖЛИВО: повертаємо ВСІ статуси зі стрічки (як з прямим відео, так і без нього),
+// щоб жоден новий твіт із прихованим донорським посиланням ніколи не був відсіяний!
+function itemsFromFxV2(j) {
   const out = [];
   const results = (j && Array.isArray(j.results)) ? j.results : ((j && j.data && Array.isArray(j.data)) ? j.data : []);
   for (const r of results) {
@@ -1862,16 +1928,11 @@ function itemsFromFxV2(j, includeCandidates = true) {
     const ts = r.created_timestamp ? r.created_timestamp * 1000 : snowTs(id);
     const text = String(r.text || (r.raw_text && r.raw_text.text) || '');
     const pv = videoFromFxTweet(r);
-    if (pv && pv.url) {
-      out.push({ id, text, videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, ts });
-      continue;
-    }
-    if (!includeCandidates) continue;
     const links = extractTweetEmbeddedLinks(r, id);
-    const hasMediaHint = links.statusIds.length > 0 || links.tcoUrls.length > 0 ||
-                         !!(r.quote || r.retweet || (r.media && (r.media.all || r.media.videos || r.media.external))) ||
-                         /pic\.twitter\.com|\/video\/\d|https?:\/\/t\.co\//i.test(text);
-    if (hasMediaHint) {
+    const donorId = (r.quote && r.quote.id) || (r.retweet && r.retweet.id) || links.statusIds[0] || '';
+    if (pv && pv.url) {
+      out.push({ id, text, videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, donorId, ts });
+    } else {
       out.push({ id, text, videoUrl: '', needsResolve: true, hintIds: links.statusIds, hintTcos: links.tcoUrls, ts });
     }
   }
@@ -1881,12 +1942,12 @@ function itemsFromFxV2(j, includeCandidates = true) {
 function pickVxVideo(v) {
   if (!v || typeof v !== 'object') return null;
   for (const m of (Array.isArray(v.media_extended) ? v.media_extended : [])) {
-    if (m && m.url && (m.type === 'video' || m.type === 'gif' || /\.mp4|video\.twimg\.com/i.test(m.url)) && !/\.m3u8(\?|$)/i.test(m.url)) {
+    if (m && m.url && (m.type === 'video' || m.type === 'gif' || /\.mp4|video\.twimg\.com/i.test(m.url))) {
       return { url: m.url, width: m.size && m.size.width, height: m.size && m.size.height, duration: m.duration_millis ? m.duration_millis / 1000 : 0 };
     }
   }
   for (const u of (Array.isArray(v.mediaURLs) ? v.mediaURLs : [])) {
-    if (/\.mp4|video\.twimg\.com/i.test(String(u)) && !/\.m3u8/i.test(String(u))) return { url: String(u) };
+    if (/\.mp4|video\.twimg\.com/i.test(String(u))) return { url: String(u) };
   }
   return null;
 }
@@ -1953,8 +2014,7 @@ async function resolveTcoLink(tcoUrl) {
   }
 }
 
-// ---- Глибоке розкриття відео з твіту (включно з Quote, Retweet, донорськими /video/1 та t.co) ----
-// ВАЖЛИВО: запитуємо як /${user}/status/${sid}, так і /i/status/${sid}, щоб ретвіти та чужі ID (як у 2-го акаунта) ЗАВЖДИ розкривались!
+// ---- Глибоке розкриття відео з твіту (Quote, Retweet, донорські /video/1, t.co, Cobalt) ----
 async function resolveTweetVideo(user, id, depth = 0, hints = {}) {
   const sid = String(id || '').trim();
   if (!isSnowflake(sid)) return null;
@@ -1977,7 +2037,7 @@ async function resolveTweetVideo(user, id, depth = 0, hints = {}) {
 
   if (text) collectFromObj({ text });
 
-  // 1) Паралельний запит до FxTwitter та FixupX (використовуємо '/i/status/' — працює для будь-якого автора чи ретвіту!)
+  // 1) Паралельний запит до FxTwitter та FixupX через '/i/status/' (відкриває будь-який ретвіт чи чужий пост)
   const fxPromises = [
     'https://api.fxtwitter.com/i/status/' + sid,
     'https://api.fixupx.com/i/status/' + sid,
@@ -2004,7 +2064,7 @@ async function resolveTweetVideo(user, id, depth = 0, hints = {}) {
           videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration,
           text: text || String((t.quote && t.quote.text) || (t.retweet && t.retweet.text) || ''),
           author: (t.author && t.author.screen_name) || u,
-          donorId: (t.quote && t.quote.id) || (t.retweet && t.retweet.id) || ''
+          donorId: (t.quote && t.quote.id) || (t.retweet && t.retweet.id) || donorIds[0] || ''
         };
         xr.resolvedCache.set(sid, { result: res, at: Date.now(), final: true });
         return res;
@@ -2024,7 +2084,7 @@ async function resolveTweetVideo(user, id, depth = 0, hints = {}) {
       collectFromObj(j);
       const pv = pickVxVideo(j) || pickVxVideo(j.qrt) || pickVxVideo(j.retweet);
       if (pv && pv.url) {
-        return { videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, text, author: j.user_screen_name || u };
+        return { videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, text, author: j.user_screen_name || u, donorId: donorIds[0] || '' };
       }
       throw new Error('no-vx-video');
     }),
@@ -2039,7 +2099,7 @@ async function resolveTweetVideo(user, id, depth = 0, hints = {}) {
       collectFromObj(j);
       const pv = pickSynVideo(j) || pickSynVideo(j.quoted_tweet) || pickSynVideo(j.parent) || pickSynVideo(j.retweeted_status);
       if (pv && pv.url) {
-        return { videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, text, author: (j.user && j.user.screen_name) || u };
+        return { videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, text, author: (j.user && j.user.screen_name) || u, donorId: donorIds[0] || '' };
       }
       throw new Error('no-syn-video');
     })()
@@ -2097,7 +2157,7 @@ async function resolveTweetVideo(user, id, depth = 0, hints = {}) {
         quality: 1080,
         audioOnly: false
       });
-      if (cob && cob.url && !/\.m3u8(\?|$)/i.test(cob.url)) {
+      if (cob && cob.url) {
         const res = { videoUrl: cob.url, text, author: u };
         xr.resolvedCache.set(sid, { result: res, at: Date.now(), final: true });
         return res;
@@ -2124,7 +2184,7 @@ async function srcFxStatuses(acc) {
         headers: { 'User-Agent': FX_UA, Accept: 'application/json', 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
       }, 8500);
       if (!r.ok || !r.json) { errs.push(base.replace(/^https?:\/\//, '') + ':' + r.status); continue; }
-      const items = itemsFromFxV2(r.json, true);
+      const items = itemsFromFxV2(r.json);
       if (items.length) return { items };
       errs.push(base.replace(/^https?:\/\//, '') + ':0');
     } catch (e) { errs.push(base.replace(/^https?:\/\//, '') + ':' + String(e.message).slice(0, 25)); }
@@ -2141,7 +2201,7 @@ async function srcFxMedia(acc) {
         headers: { 'User-Agent': FX_UA, Accept: 'application/json', 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
       }, 8500);
       if (!r.ok || !r.json) { errs.push(base.replace(/^https?:\/\//, '') + ':' + r.status); continue; }
-      const items = itemsFromFxV2(r.json, true);
+      const items = itemsFromFxV2(r.json);
       if (items.length) return { items };
       errs.push(base.replace(/^https?:\/\//, '') + ':0');
     } catch (e) { errs.push(base.replace(/^https?:\/\//, '') + ':' + String(e.message).slice(0, 25)); }
@@ -2183,15 +2243,13 @@ async function srcXApi(acc) {
     }
     if (!added) {
       const links = extractTweetEmbeddedLinks(t, id);
-      if (links.statusIds.length || links.tcoUrls.length || (t.referenced_tweets && t.referenced_tweets.length)) {
-        items.push({ id, text, videoUrl: '', needsResolve: true, hintIds: links.statusIds, hintTcos: links.tcoUrls, ts: snowTs(id) });
-      }
+      items.push({ id, text, videoUrl: '', needsResolve: true, hintIds: links.statusIds, hintTcos: links.tcoUrls, ts: snowTs(id) });
     }
   }
   return { items };
 }
 
-// 4. Twitter Syndication (підтримує як JSON timeline, так і прямий парсинг свіжих entry_id)
+// 4. Twitter Syndication (JSON timeline + прямий парсинг свіжих entry_id)
 async function srcSyndication(acc) {
   const maxAge = Math.max(X_MAX_AGE_MS || 0, 36 * 3600 * 1000);
   for (const showReplies of ['false', 'true']) {
@@ -2216,13 +2274,11 @@ async function srcSyndication(acc) {
           seenIds.add(id);
           const text = String(t.full_text || t.text || '');
           const pv = pickSynVideo(t) || pickSynVideo(t.retweeted_status) || pickSynVideo(t.quoted_status);
+          const links = extractTweetEmbeddedLinks(t, id);
           if (pv && pv.url) {
-            items.push({ id, text, videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, ts });
+            items.push({ id, text, videoUrl: pv.url, width: pv.width, height: pv.height, duration: pv.duration, donorId: links.statusIds[0] || '', ts });
           } else {
-            const links = extractTweetEmbeddedLinks(t, id);
-            if (links.statusIds.length || links.tcoUrls.length || /pic\.twitter\.com|\/video\/|https?:\/\/t\.co\//i.test(text)) {
-              items.push({ id, text, videoUrl: '', needsResolve: true, hintIds: links.statusIds, hintTcos: links.tcoUrls, ts });
-            }
+            items.push({ id, text, videoUrl: '', needsResolve: true, hintIds: links.statusIds, hintTcos: links.tcoUrls, ts });
           }
         }
       } catch (e) {}
@@ -2312,7 +2368,6 @@ function parseNitterHtmlItems(html) {
   const items = [];
   const seenIds = new Set();
   const str = String(html || '');
-  // Розбиваємо по timeline-item, якщо є, щоб витягнути і основний ID, і донорські посилання всередині поста
   const chunks = str.split(/class="timeline-item/i);
   if (chunks.length > 1) {
     for (let i = 1; i < chunks.length; i++) {
@@ -2343,7 +2398,6 @@ function parseNitterHtmlItems(html) {
 async function srcNitter(acc) {
   const hosts = await nitterHosts();
   const tryHost = async host => {
-    // 1) RSS
     try {
       const r = await fetchJson(host + '/' + encodeURIComponent(acc) + '/rss', {
         headers: { 'User-Agent': BROWSER_UA, Accept: 'application/rss+xml,text/xml,text/html,*/*', 'Cache-Control': 'no-cache' }
@@ -2353,7 +2407,6 @@ async function srcNitter(acc) {
         if (items.length) return { items, host };
       }
     } catch (e) {}
-    // 2) HTML профіль
     for (const suffix of ['', '/media']) {
       try {
         const rHtml = await fetchJson(host + '/' + encodeURIComponent(acc) + suffix, {
@@ -2377,7 +2430,7 @@ async function srcNitter(acc) {
   throw new Error('nitter: інстанси недоступні');
 }
 
-// 6. Jina Web Reader Mirror (обходить Cloudflare для x.com та xcancel.com — надзвичайно надійний резерв для будь-якого 2-го/3-го акаунта!)
+// 6. Jina Web Reader Mirror (обходить Cloudflare для x.com та xcancel.com)
 async function srcJinaMirror(acc) {
   const urls = [
     'https://r.jina.ai/https://xcancel.com/' + encodeURIComponent(acc),
@@ -2414,7 +2467,7 @@ const X_SOURCES = [
   ['xapi', srcXApi]
 ];
 
-// Паралельне агрегування постів з усіх джерел для конкретного акаунта (з індивідуальними кулдаунами на кожен акаунт!)
+// Паралельне агрегування постів з усіх джерел для конкретного акаунта
 async function fetchXPosts(acc, { forceAll = false } = {}) {
   const activeSources = X_SOURCES.filter(([name]) => {
     if (name === 'xapi' && !X_BEARER_TOKEN) return false;
@@ -2460,6 +2513,7 @@ async function fetchXPosts(acc, { forceAll = false } = {}) {
             width: prev.width || it.width,
             height: prev.height || it.height,
             duration: prev.duration || it.duration,
+            donorId: prev.donorId || it.donorId || '',
             needsResolve: !(prev.videoUrl || it.videoUrl),
             hintIds: uniq([...(prev.hintIds || []), ...(it.hintIds || [])]),
             hintTcos: uniq([...(prev.hintTcos || []), ...(it.hintTcos || [])])
@@ -2482,7 +2536,7 @@ async function fetchXPosts(acc, { forceAll = false } = {}) {
   return { items, source: okSources.join('+') || 'empty', perSourceCounts };
 }
 
-// ---- відправка в канали (коректна робота з 1-м, 2-м і будь-якою кількістю каналів!) ----
+// ---- відправка в канали (звичайна АБО у відложку каналу schedule_date на 1 день, якщо є підозра на повтор!) ----
 function xCaption(text) {
   const clean = String(text || '')
     .replace(/https?:\/\/\S+/g, '')
@@ -2496,39 +2550,55 @@ function xCaption(text) {
 }
 
 async function sendXVideoToChat(token, chat, item, caption, cache) {
-  const base = { chat_id: chat };
-  // Якщо вже є кешований cloud fileId для цього токена — пробуємо миттєву відправку
-  if (cache.cloudFileId && cache.token === token) {
+  const sched = item.scheduleDate && Number(item.scheduleDate) > 0 ? Math.floor(Number(item.scheduleDate)) : 0;
+  const base = {
+    chat_id: chat,
+    ...(sched ? { schedule_date: sched } : {})
+  };
+  const isHls = /\.m3u8(\?|$)/i.test(String(item.videoUrl || ''));
+
+  if (!isHls && cache.cloudFileId && cache.token === token) {
     try {
       return await tg(token, 'sendVideo', { ...base, video: cache.cloudFileId, caption, supports_streaming: true }, { timeout: 25000, noRetry: true });
     } catch (e) {
       if (/chat not found|not enough rights|have no rights|bot was kicked|not a member|forbidden|CHAT_WRITE_FORBIDDEN|CHAT_ADMIN_REQUIRED/i.test(e.message)) throw e;
     }
   }
-  // Спроба №1: пряма відправка URL через Telegram Cloud API
-  try {
-    const res = await tg(token, 'sendVideo', {
-      ...base, video: item.videoUrl, caption, supports_streaming: true,
-      ...(item.width ? { width: item.width } : {}), ...(item.height ? { height: item.height } : {}), ...(item.duration ? { duration: Math.round(item.duration) } : {})
-    }, { timeout: 35000, noRetry: true });
-    if (res && res.video && res.video.file_id) {
-      cache.cloudFileId = res.video.file_id;
-      cache.token = token;
+  if (!isHls) {
+    try {
+      const res = await tg(token, 'sendVideo', {
+        ...base, video: item.videoUrl, caption, supports_streaming: true,
+        ...(item.width ? { width: item.width } : {}), ...(item.height ? { height: item.height } : {}), ...(item.duration ? { duration: Math.round(item.duration) } : {})
+      }, { timeout: 35000, noRetry: true });
+      if (res && res.video && res.video.file_id) {
+        cache.cloudFileId = res.video.file_id;
+        cache.token = token;
+      }
+      return res;
+    } catch (e) {
+      if (/chat not found|not enough rights|have no rights|bot was kicked|not a member|forbidden|CHAT_WRITE_FORBIDDEN|CHAT_ADMIN_REQUIRED/i.test(e.message)) throw e;
     }
-    return res;
-  } catch (e) {
-    if (/chat not found|not enough rights|have no rights|bot was kicked|not a member|forbidden|CHAT_WRITE_FORBIDDEN|CHAT_ADMIN_REQUIRED/i.test(e.message)) throw e;
   }
-  // Спроба №2: скачуємо файл на диск один раз і роздаємо в усі канали (і 1-й, і 2-й, і наступні!)
+
+  // Якщо >20 МБ або HLS (.m3u8) — качаємо один раз на диск і відправляємо в усі підключені канали
   if (!cache.file || !fileSize(cache.file)) {
     cache.file = tmpName('.mp4');
-    await downloadToFile(item.videoUrl, cache.file, { referer: 'https://x.com/' });
+    if (isHls) {
+      await hlsToMp4(item.videoUrl, cache.file, { referer: 'https://x.com/' });
+    } else {
+      await downloadToFile(item.videoUrl, cache.file, { referer: 'https://x.com/' });
+    }
     cache.info = await probe(cache.file).catch(() => ({}));
     const norm = await normalizeForTelegram(cache.file, cache.info, { allowTranscode: false });
     if (norm.file !== cache.file) { safeUnlink(cache.file); cache.file = norm.file; cache.info = await probe(cache.file).catch(() => cache.info); }
   }
   const res = await sendFileToTelegram({
-    token, chatId: chat, mode: 'video', file: cache.file, caption: esc(caption),
+    token,
+    chatId: chat,
+    mode: 'video',
+    file: cache.file,
+    caption: esc(caption),
+    scheduleDate: sched,
     meta: { width: cache.info.width || item.width, height: cache.info.height || item.height, duration: cache.info.duration || item.duration }
   });
   if (res && res.video && res.video.file_id && !localApiReady) {
@@ -2542,7 +2612,7 @@ async function postToTargets(item, targets, tokenOverride = '') {
   const token = tokenOverride || X.token || Store.token();
   const targetList = uniq((Array.isArray(targets) && targets.length ? targets : allTargets()).map(parseTelegramChat).filter(Boolean));
   const caption = xCaption(item.text);
-  const cache = { cloudFileId: item.cachedFileId && item.cachedToken === token ? item.cachedFileId : '', token };
+  const cache = {};
   const sent = []; const failed = [];
   try {
     for (const chat of targetList) {
@@ -2558,273 +2628,23 @@ async function postToTargets(item, targets, tokenOverride = '') {
     }
   } finally { if (cache.file) safeUnlink(cache.file); }
   if (sent.length) {
-    X.posted += 1;
-    rememberPostMeta(item.account || '', item.id || '', item.text || '');
+    if (item.scheduleDate) X.scheduledDups = (X.scheduledDups || 0) + 1;
+    else X.posted += 1;
     Store.schedule();
   }
   return { sent, failed };
 }
 
-// ==================== СИСТЕМА ВІДЛОЖКИ НА 1 ДЕНЬ (24 ГОД) ДЛЯ ПЕРЕВІРКИ ПОВТОРІВ ====================
-function formatHoldTime(ts) {
-  try {
-    return new Date(ts).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
-  } catch (e) { return '—'; }
-}
-
-function buildHoldPreviewCaption(qItem) {
-  const hours = Math.max(1, Math.round((qItem.publishAt - qItem.createdAt) / 3600000));
-  const remMin = Math.max(0, Math.round((qItem.publishAt - Date.now()) / 60000));
-  const remLabel = remMin >= 60 ? (Math.floor(remMin / 60) + ' ч ' + (remMin % 60) + ' мин') : (remMin + ' мин');
-  const header = [
-    '📅 <b>В ОТЛОЖКЕ НА ' + hours + ' Ч (проверка на повторы)</b>',
-    '⏰ Автовыход в канал: через <b>' + remLabel + '</b> (<code>' + formatHoldTime(qItem.publishAt) + '</code>)',
-    '📡 Источник: <b>@' + esc(qItem.account) + '</b> → <code>' + esc((qItem.targets || allTargets()).join(', ')) + '</code>',
-    ...(qItem.dupWarning ? ['⚠️ <b>' + esc(qItem.dupWarning) + '</b>'] : []),
-    '──────────────',
-    esc(xCaption(qItem.text))
-  ];
-  return header.join('\n').slice(0, 1020);
-}
-
-function buildHoldPreviewKb(qid) {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Выложить сейчас', callback_data: 'xw:qpub:' + qid },
-        { text: '🗑 Удалить (повтор)', callback_data: 'xw:qdel:' + qid }
-      ],
-      [
-        { text: '⏳ Через 1 ч', callback_data: 'xw:q1h:' + qid },
-        { text: '📋 Вся отложка', callback_data: 'xw:queue' }
-      ]
-    ]
-  };
-}
-
-// Додає нове відео у відложку на 1 день (24 год) і надсилає прев'ю-картку адміну з кнопками перевірки
-async function enqueueHoldVideo(acc, item, targets, dupSim = null) {
-  if (!Array.isArray(X.queue)) X.queue = [];
-  const holdMs = Math.max(1, Number(X.holdHours) || 24) * 3600 * 1000;
-  const now = Date.now();
-  const qid = Date.now().toString(36).slice(-4) + crypto.randomBytes(2).toString('hex');
-  const mKey = videoMediaKey(item.videoUrl, item.donorId);
-  const dupWarning = dupSim ? ('Возможный повтор! Похожий пост уже был от @' + dupSim.acc + (dupSim.inQueue ? ' (в отложке)' : '')) : '';
-
-  const qItem = {
-    qid,
-    account: acc,
-    id: String(item.id),
-    videoUrl: item.videoUrl,
-    width: item.width,
-    height: item.height,
-    duration: item.duration,
-    text: item.text || '',
-    mediaKey: mKey,
-    createdAt: now,
-    publishAt: now + holdMs,
-    targets: uniq((targets && targets.length ? targets : allTargets()).map(parseTelegramChat).filter(Boolean)),
-    dupWarning,
-    adminChatId: String(runtime.adminChat || ADMIN_CHAT_ID),
-    adminMsgId: 0,
-    adminToken: '',
-    cachedFileId: ''
-  };
-
-  // Надсилаємо прев'ю відео в адмін-чат через основного бота (щоб інлайн-кнопки працювали миттєво через webhook!)
-  const previewTok = Store.token() || X.token;
-  if (previewTok && qItem.adminChatId) {
-    const cache = {};
-    try {
-      const cap = buildHoldPreviewCaption(qItem);
-      const kb = buildHoldPreviewKb(qid);
-      let sentMsg = null;
-      try {
-        sentMsg = await tg(previewTok, 'sendVideo', {
-          chat_id: qItem.adminChatId,
-          video: qItem.videoUrl,
-          caption: cap,
-          parse_mode: 'HTML',
-          supports_streaming: true,
-          reply_markup: kb,
-          ...(qItem.width ? { width: qItem.width } : {}),
-          ...(qItem.height ? { height: qItem.height } : {}),
-          ...(qItem.duration ? { duration: Math.round(qItem.duration) } : {})
-        }, { timeout: 30000, noRetry: true });
-      } catch (e) {
-        // Якщо за URL не пішло — качаємо файл і відправляємо з кнопками
-        cache.file = tmpName('.mp4');
-        await downloadToFile(qItem.videoUrl, cache.file, { referer: 'https://x.com/' });
-        cache.info = await probe(cache.file).catch(() => ({}));
-        sentMsg = await sendFileToTelegram({
-          token: previewTok,
-          chatId: qItem.adminChatId,
-          mode: 'video',
-          file: cache.file,
-          caption: cap,
-          markup: kb,
-          meta: { width: cache.info.width || qItem.width, height: cache.info.height || qItem.height, duration: cache.info.duration || qItem.duration }
-        });
-      }
-      if (sentMsg && sentMsg.message_id) {
-        qItem.adminMsgId = sentMsg.message_id;
-        qItem.adminToken = previewTok;
-        if (sentMsg.video && sentMsg.video.file_id && previewTok === X.token) {
-          qItem.cachedFileId = sentMsg.video.file_id;
-          qItem.cachedToken = previewTok;
-        }
-      }
-    } catch (e) {
-      log('xwatch', 'не вдалось надіслати прев\'ю відложки адміну:', redact(e.message).slice(0, 120));
-    } finally {
-      if (cache.file) safeUnlink(cache.file);
-    }
-  }
-
-  X.queue.push(qItem);
-  markGlobalMediaSeen(mKey);
-  rememberPostMeta(acc, item.id, item.text);
-  Store.schedule();
-  log('xwatch', 'додано у відложку на', X.holdHours || 24, 'год:', acc, item.id, 'qid=' + qid);
-  return qItem;
-}
-
-async function updateHoldAdminCard(qItem, statusLine) {
-  if (!qItem || !qItem.adminMsgId || !qItem.adminChatId) return;
-  const tok = qItem.adminToken || Store.token() || X.token;
-  if (!tok) return;
-  const newCap = statusLine + '\n📡 <b>@' + esc(qItem.account) + '</b> → <code>' + esc((qItem.targets || allTargets()).join(', ')) + '</code>\n──────────────\n' + esc(xCaption(qItem.text)).slice(0, 750);
-  await tg(tok, 'editMessageCaption', {
-    chat_id: qItem.adminChatId,
-    message_id: qItem.adminMsgId,
-    caption: newCap,
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [] }
-  }, { timeout: 10000, noRetry: true }).catch(() => {});
-}
-
-// Перевіряє чергу відложки і публікує ті відео, яким вже виповнився 1 день (або час виходу настав)
-async function processHoldQueue() {
-  if (!Array.isArray(X.queue) || !X.queue.length) return 0;
-  const now = Date.now();
-  const due = X.queue.filter(q => q && now >= (q.publishAt || 0));
-  if (!due.length) return 0;
-  let published = 0;
-  for (const qItem of due.slice(0, 5)) {
-    const r = await postToTargets(qItem, qItem.targets && qItem.targets.length ? qItem.targets : allTargets());
-    if (r.sent.length) {
-      X.queue = X.queue.filter(x => x.qid !== qItem.qid);
-      published++;
-      xr.lastOkAt = Date.now();
-      await updateHoldAdminCard(qItem, '✅ <b>ОПУБЛИКОВАНО В КАНАЛ (по таймеру отложки)</b>');
-      log('xwatch', 'відложка опублікована:', qItem.account, qItem.id, '→', r.sent.join(','));
-    } else {
-      // Відкладаємо повторну спробу на 2 хвилини
-      qItem.publishAt = Date.now() + 120000;
-    }
-  }
-  if (published) Store.schedule();
-  return published;
-}
-
-// Ручні дії з відложкою (викласти зараз / видалити повтор / змінити час / очистити)
-async function handleQueueAction(b) {
-  if (!Array.isArray(X.queue)) X.queue = [];
-  const act = String(b.queueAction || '').trim();
-  const qid = String(b.qid || '').trim();
-
-  if (act === 'pub' && qid) {
-    const qItem = X.queue.find(x => x.qid === qid);
-    if (!qItem) return { ok: false, msg: 'Пост вже опублікований або видалений з відложки' };
-    const r = await postToTargets(qItem, qItem.targets && qItem.targets.length ? qItem.targets : allTargets());
-    if (r.sent.length) {
-      X.queue = X.queue.filter(x => x.qid !== qid);
-      Store.schedule();
-      await updateHoldAdminCard(qItem, '✅ <b>ОПУБЛИКОВАНО В КАНАЛ ВРУЧНУЮ</b>');
-      return { ok: true, msg: '✅ Опубліковано в ' + r.sent.join(', ') };
-    }
-    return { ok: false, msg: '❌ Помилка публікації: ' + ((r.failed[0] && r.failed[0].err) || 'не вдалось') };
-  }
-
-  if (act === 'del' && qid) {
-    const qItem = X.queue.find(x => x.qid === qid);
-    if (!qItem) return { ok: false, msg: 'Вже видалено з відложки' };
-    X.queue = X.queue.filter(x => x.qid !== qid);
-    Store.schedule();
-    await updateHoldAdminCard(qItem, '🗑 <b>УДАЛЕНО ИЗ ОТЛОЖКИ (ПОВТОР)</b>');
-    return { ok: true, msg: '🗑 Видалено з відложки (повтор скасовано)' };
-  }
-
-  if (act === '1h' && qid) {
-    const qItem = X.queue.find(x => x.qid === qid);
-    if (!qItem) return { ok: false, msg: 'Пост не знайдено у відложці' };
-    qItem.publishAt = Date.now() + 3600 * 1000;
-    Store.schedule();
-    const tok = qItem.adminToken || Store.token() || X.token;
-    if (tok && qItem.adminMsgId && qItem.adminChatId) {
-      await tg(tok, 'editMessageCaption', {
-        chat_id: qItem.adminChatId,
-        message_id: qItem.adminMsgId,
-        caption: buildHoldPreviewCaption(qItem),
-        parse_mode: 'HTML',
-        reply_markup: buildHoldPreviewKb(qItem.qid)
-      }, { timeout: 10000, noRetry: true }).catch(() => {});
-    }
-    return { ok: true, msg: '⏳ Час виходу перенесено на +1 годину' };
-  }
-
-  if (act === 'pubnext') {
-    const sorted = [...X.queue].sort((a, b) => (a.publishAt || 0) - (b.publishAt || 0));
-    const qItem = sorted[0];
-    if (!qItem) return { ok: false, msg: 'Відложка порожня' };
-    return handleQueueAction({ queueAction: 'pub', qid: qItem.qid });
-  }
-
-  if (act === 'puball') {
-    let count = 0;
-    for (const qItem of [...X.queue]) {
-      const r = await postToTargets(qItem, qItem.targets && qItem.targets.length ? qItem.targets : allTargets());
-      if (r.sent.length) {
-        X.queue = X.queue.filter(x => x.qid !== qItem.qid);
-        count++;
-        await updateHoldAdminCard(qItem, '✅ <b>ОПУБЛИКОВАНО В КАНАЛ ВРУЧНУЮ</b>');
-      }
-    }
-    Store.schedule();
-    return { ok: true, msg: '✅ Опубліковано з відложки: ' + count };
-  }
-
-  if (act === 'clear') {
-    const n = X.queue.length;
-    for (const qItem of X.queue.slice(0, 15)) {
-      await updateHoldAdminCard(qItem, '🗑 <b>УДАЛЕНО (ОЧИСТКА ОТЛОЖКИ)</b>');
-    }
-    X.queue = [];
-    Store.schedule();
-    return { ok: true, msg: '🗑 Очищено постів із відложки: ' + n };
-  }
-
-  return { ok: false, msg: 'Невідома дія' };
-}
-
-// ---- виявлення каналів + обробка кнопок відложки, якщо картка була надіслана через X.token ----
+// ---- виявлення каналів, куди додали бота-постера ----
 async function discoverChats() {
   xr.lastDiscoverAt = Date.now();
   const tok = X.token;
   if (!tok) return;
   try {
-    const upd = await tg(tok, 'getUpdates', { offset: X.offset ? X.offset + 1 : undefined, limit: 100, timeout: 0, allowed_updates: ['my_chat_member', 'channel_post', 'callback_query'] }, { timeout: 15000, noRetry: true });
+    const upd = await tg(tok, 'getUpdates', { offset: X.offset ? X.offset + 1 : undefined, limit: 100, timeout: 0, allowed_updates: ['my_chat_member', 'channel_post'] }, { timeout: 15000, noRetry: true });
     let changed = false;
     for (const u of upd) {
       if (u.update_id > X.offset) { X.offset = u.update_id; changed = true; }
-      if (u.callback_query && u.callback_query.data && String(u.callback_query.data).startsWith('xw:q')) {
-        const parts = String(u.callback_query.data).split(':');
-        const sub = parts[1].slice(1); // qpub -> pub, qdel -> del, q1h -> 1h
-        const qid = parts[2] || '';
-        const res = await handleQueueAction({ queueAction: sub, qid });
-        await tg(tok, 'answerCallbackQuery', { callback_query_id: u.callback_query.id, text: res.msg || 'Готово' }, { timeout: 8000, noRetry: true }).catch(() => {});
-        continue;
-      }
       const mcm = u.my_chat_member;
       const chat = (mcm && mcm.chat) || (u.channel_post && u.channel_post.chat);
       if (!chat || !['channel', 'supergroup', 'group'].includes(chat.type)) continue;
@@ -2887,8 +2707,7 @@ async function pollAccount(acc, targets) {
   pa.error = ''; pa.source = res.source; pa.at = Date.now(); pa.found = res.items.length;
   const seen = new Set(X.seen[key] || []);
 
-  // ВАЖЛИВО: Якщо для 2-го чи нового акаунта ще немає базової лінії, встановлюємо її ТІЛЬКИ коли отримано хоча б 1 пост,
-  // а як базовий час беремо час найновішого поточного поста (а не Date.now()), щоб жоден новий пост не загубився!
+  // Встановлення базової лінії тільки коли отримано реальні пости (щоб 2-й акаунт ніколи не залипав з порожнім baseline!)
   if (!X.baseline[key]) {
     if (!res.items.length) {
       pa.note = 'очікую пости від джерел (стрічка порожня)';
@@ -2928,7 +2747,8 @@ async function pollAccount(acc, targets) {
   }
 
   const toPost = postable.slice(0, 10);
-  let handledCount = 0;
+  let postedNow = 0;
+  let scheduledDupCount = 0;
   let pendingRetry = 0;
 
   for (const it of toPost) {
@@ -2948,33 +2768,33 @@ async function pollAccount(acc, targets) {
       item = { ...item, videoUrl: v.videoUrl, width: v.width, height: v.height, duration: v.duration, text: v.text || it.text, donorId: v.donorId || '' };
     }
 
-    // Глобальний захист від точних дублів відео між 1-м і 2-м акаунтами
-    const mKey = videoMediaKey(item.videoUrl, item.donorId);
-    if (hasGlobalMediaSeen(mKey)) {
+    // Перевірка на підозру на повтор!
+    // Якщо відео унікальне — публікуємо ОДРАЗУ в канал.
+    // Якщо є підозра на повтор — відправляємо в відложку каналу (schedule_date на 1 день / 24 год) БЕЗ повідомлень у приват бота!
+    const dupCheck = checkDuplicateSuspicion(item, acc);
+    if (dupCheck && dupCheck.exactTwice) {
       pushSeen(key, it.id);
-      log('xwatch', acc, it.id, 'точний дубль відео (' + mKey + ') вже взято з іншого акаунта, пропускаю');
+      log('xwatch', acc, it.id, 'повтор уже у відложці, втретє пропускаю');
       continue;
     }
 
-    const dupSim = findSimilarRecentPost(item.text, acc, item.id);
-
-    // Якщо увімкнено режим "Відложка на 1 день (24 год)" — кладемо у відложку з прев'ю для перевірки людиною!
-    if (X.holdEnabled) {
-      await enqueueHoldVideo(acc, item, targets, dupSim);
-      pushSeen(key, it.id);
-      handledCount++;
-      xr.lastOkAt = Date.now();
-      continue;
+    if (dupCheck && dupCheck.isDup && X.holdEnabled) {
+      const holdSec = Math.max(1, Number(X.holdHours) || 24) * 3600;
+      item.scheduleDate = Math.floor(Date.now() / 1000) + holdSec;
+      xr.scheduledMediaKeys.add(dupCheck.mKey);
+      log('xwatch', acc, it.id, 'підозра на повтор (' + dupCheck.reason + ' з @' + dupCheck.prevAcc + ') → у відложку каналу schedule_date на', X.holdHours || 24, 'год');
+    } else {
+      item.scheduleDate = 0;
     }
 
-    // Інакше публікуємо одразу в усі цільові канали
     const r = await postToTargets(item, targets);
     if (r.sent.length) {
       pushSeen(key, it.id);
-      markGlobalMediaSeen(mKey);
-      handledCount++;
+      recordPublishedVideo(item, acc);
+      if (item.scheduleDate) scheduledDupCount++;
+      else postedNow++;
       xr.lastOkAt = Date.now();
-      log('xwatch', 'надіслано', acc, it.id, '→', r.sent.join(','));
+      log('xwatch', item.scheduleDate ? 'у відложку каналу (24ч)' : 'надіслано', acc, it.id, '→', r.sent.join(','));
     } else {
       const n = (xr.tries[it.id] = (xr.tries[it.id] || 0) + 1);
       if (n >= 4) {
@@ -2988,9 +2808,16 @@ async function pollAccount(acc, targets) {
   }
 
   Store.schedule();
-  pa.note = handledCount
-    ? (X.holdEnabled ? ('📅 у відложку (24ч): +' + handledCount) : ('✅ опубліковано: +' + handledCount))
-    : (pendingRetry ? ('⏳ очікую рендер відео (' + pendingRetry + ')') : 'нових відео немає');
+  if (postedNow || scheduledDupCount) {
+    const parts = [];
+    if (postedNow) parts.push('✅ опубліковано: +' + postedNow);
+    if (scheduledDupCount) parts.push('📅 підозра на повтор → у відложку 24ч: +' + scheduledDupCount);
+    pa.note = parts.join(' · ');
+  } else if (pendingRetry) {
+    pa.note = '⏳ очікую рендер відео (' + pendingRetry + ')';
+  } else {
+    pa.note = 'нових відео немає';
+  }
   return true;
 }
 
@@ -3011,16 +2838,12 @@ async function xTick() {
     if (Date.now() - xr.lastDiscoverAt > 60000) await discoverChats();
     if (Date.now() - xr.lastVerifyAt > 15 * 60 * 1000) await verifyTargets().catch(() => {});
 
-    // Спочатку перевіряємо чергу відложки (чи настав час публікувати пости, що відлежали 24 год)
-    await processHoldQueue().catch(e => log('xwatch', 'помилка processHoldQueue:', e.message));
-
     const targets = allTargets();
     if (!targets.length) { xr.phase = 'немає каналів (додай бота адміном у канал або /xwatch chat)'; return; }
     if (!X.accounts.length) { xr.phase = 'немає акаунтів X'; return; }
     xr.phase = 'працює';
 
-    // ВАЖЛИВО: Ротуємо стартовий акаунт на кожному тику (Round-Robin) + робимо паузу 850 мс між акаунтами,
-    // щоб 1-й і 2-й акаунти (@GoalsXtra і @TheGoalsZone) мали однакову пріоритетність і НЕ збивали один одного лімітами!
+    // Ротуємо стартовий акаунт на кожному тику (Round-Robin) + пауза 850 мс між акаунтами
     const accs = [...X.accounts];
     const shift = xr.rrIndex % accs.length;
     xr.rrIndex = (xr.rrIndex + 1) % Math.max(1, accs.length);
@@ -3054,7 +2877,6 @@ async function runXDiag({ adminChat = '', fallbackToken = '' } = {}) {
   const targets = allTargets();
   const reportLines = ['🩺 <b>Повна діагностика X-Watcher (всі акаунти, джерела та канали)</b>', ''];
 
-  // 1. Перевірка каналів
   reportLines.push('📢 <b>1. Перевірка Telegram-каналів (' + targets.length + '):</b>');
   if (!targets.length) {
     reportLines.push('   ❌ Жодного каналу не підключено!');
@@ -3068,8 +2890,7 @@ async function runXDiag({ adminChat = '', fallbackToken = '' } = {}) {
   }
   reportLines.push('');
 
-  // 2. Перевірка КОЖНОГО акаунта X по всіх джерелах
-  reportLines.push('👥 <b>2. Перевірка акаунтів X (' + X.accounts.length + '):</b>');
+  reportLines.push('👥 <b>2. Перевірка КОЖНОГО акаунта X (' + X.accounts.length + '):</b>');
   for (let idx = 0; idx < X.accounts.length; idx++) {
     const acc = X.accounts[idx];
     const t0 = Date.now();
@@ -3077,7 +2898,7 @@ async function runXDiag({ adminChat = '', fallbackToken = '' } = {}) {
       const res = await fetchXPosts(acc, { forceAll: true });
       const perSrc = Object.entries(res.perSourceCounts || {}).map(([k, v]) => v.ok ? (k + ':' + v.count) : (k + ':❌')).join(', ');
       let resolvedSample = null;
-      for (const it of res.items.slice(0, 6)) {
+      for (const it of res.items.slice(0, 8)) {
         if (it.videoUrl) { resolvedSample = { id: it.id, url: it.videoUrl }; break; }
         const v = await resolveTweetVideo(acc, it.id, 0, it);
         if (v && v.videoUrl) { resolvedSample = { id: it.id, url: v.videoUrl, donorId: v.donorId }; break; }
@@ -3086,7 +2907,7 @@ async function runXDiag({ adminChat = '', fallbackToken = '' } = {}) {
         '   ' + (idx + 1) + ') <b>@' + esc(acc) + '</b> (' + Math.round((Date.now() - t0) / 100) / 10 + 'с):\n' +
         '      • Знайдено постів: <b>' + res.items.length + '</b> (активні: <code>' + esc(res.source) + '</code>)\n' +
         '      • Деталі джерел: <code>' + esc(perSrc) + '</code>\n' +
-        '      • Тест витягування відео: ' + (resolvedSample ? ('✅ OK (пост <code>' + resolvedSample.id + '</code>' + (resolvedSample.donorId ? ', донор <code>' + resolvedSample.donorId + '</code>' : '') + ')') : '⚠️ серед останніх 6 постів відео не знайдено')
+        '      • Тест витягування відео: ' + (resolvedSample ? ('✅ OK (пост <code>' + resolvedSample.id + '</code>' + (resolvedSample.donorId ? ', донор <code>' + resolvedSample.donorId + '</code>' : '') + ')') : '⚠️ серед останніх 8 постів відео не знайдено')
       );
     } catch (e) {
       reportLines.push('   ' + (idx + 1) + ') <b>@' + esc(acc) + '</b>: ❌ ' + esc(redact(e.message).slice(0, 200)));
@@ -3094,11 +2915,10 @@ async function runXDiag({ adminChat = '', fallbackToken = '' } = {}) {
   }
   reportLines.push('');
 
-  // 3. Відложка та анти-дубль
   reportLines.push(
-    '📅 <b>3. Режим відложки (1 день / 24 год):</b> ' + (X.holdEnabled ? ('🟢 УВІМКНЕНО (' + (X.holdHours || 24) + ' год)') : '⚪ ВИМКНЕНО (одразу в канал)') + '\n' +
-    '   • Зараз у черзі відложки: <b>' + ((X.queue && X.queue.length) || 0) + '</b> відео\n' +
-    '   • База анти-дублів відео: <b>' + ((X.mediaSeen && X.mediaSeen.length) || 0) + '</b> хешів'
+    '📅 <b>3. Відложка Telegram (schedule_date на 1 день тільки для повторів):</b> ' + (X.holdEnabled ? ('🟢 АКТИВНА (' + (X.holdHours || 24) + ' год)') : '⚪ ВИМКНЕНА') + '\n' +
+    '   • Відправлено у відложку (підозра на повтор): <b>' + (X.scheduledDups || 0) + '</b>\n' +
+    '   • База анти-дублів відео: <b>' + ((X.mediaSeen && X.mediaSeen.length) || 0) + '</b> записів'
   );
 
   const text = reportLines.join('\n');
@@ -3109,15 +2929,15 @@ async function runXDiag({ adminChat = '', fallbackToken = '' } = {}) {
   return { ok: true, text };
 }
 
-// ---- ТЕСТ: бере останні N відео з КОЖНОГО акаунта і кладе у відложку (або одразу в усі канали, якщо mode='live') ----
-async function runXTest({ account = '', chat = '', limit = 1, mode = 'auto', adminChat = '', fallbackToken = '' } = {}) {
+// ---- ТЕСТ: бере останні N відео з КОЖНОГО акаунта і публікує в УСІ підключені канали ----
+async function runXTest({ account = '', chat = '', limit = 1, mode = 'live', adminChat = '', fallbackToken = '' } = {}) {
   const lim = Math.max(1, Math.min(4, Number(limit) || 1));
   const accounts = account ? [parseXUsername(account)].filter(Boolean) : [...X.accounts];
   const destTargets = chat ? uniq(parseList(chat).map(parseTelegramChat).filter(Boolean)) : allTargets();
   const admin = String(adminChat || runtime.adminChat || ADMIN_CHAT_ID);
   const adminTok = Store.token() || fallbackToken || X.token;
   const posterTok = X.token || fallbackToken || Store.token();
-  const useHold = mode === 'hold' ? true : (mode === 'live' ? false : !!X.holdEnabled);
+  const forceSchedule = mode === 'schedule' || mode === 'hold';
   const lines = [];
   let total = 0;
 
@@ -3141,18 +2961,19 @@ async function runXTest({ account = '', chat = '', limit = 1, mode = 'auto', adm
         continue;
       }
       let posted = 0;
-      let where = useHold ? ('відложка на ' + (X.holdHours || 24) + ' год (прев\'ю в адмін-чаті)') : (destTargets.join(', ') || admin);
+      let where = destTargets.join(', ') || admin;
       for (const v of videos.sort((a, b) => cmpId(a.id, b.id))) {
         pushSeen(key, v.id);
-        if (useHold) {
-          const dupSim = findSimilarRecentPost(v.text, acc, v.id);
-          await enqueueHoldVideo(acc, v, destTargets, dupSim);
+        if (forceSchedule) {
+          v.scheduleDate = Math.floor(Date.now() / 1000) + Math.max(1, Number(X.holdHours) || 24) * 3600;
+        }
+        let r = destTargets.length && posterTok ? await postToTargets(v, destTargets, posterTok) : { sent: [], failed: [{ chat: where, err: 'немає каналу/токена' }] };
+        if (!r.sent.length && adminTok) { r = await postToTargets(v, [admin], adminTok); where = admin + ' (резерв)'; }
+        if (r.sent.length) {
           posted++;
+          recordPublishedVideo(v, acc);
         } else {
-          let r = destTargets.length && posterTok ? await postToTargets(v, destTargets, posterTok) : { sent: [], failed: [{ chat: where, err: 'немає каналу/токена' }] };
-          if (!r.sent.length && adminTok) { r = await postToTargets(v, [admin], adminTok); where = admin + ' (резерв)'; }
-          if (r.sent.length) posted++;
-          else lines.push('   ⚠️ @' + esc(acc) + ' ' + v.id + ': ' + esc((r.failed[0] && r.failed[0].err) || 'не вдалось'));
+          lines.push('   ⚠️ @' + esc(acc) + ' ' + v.id + ': ' + esc((r.failed[0] && r.failed[0].err) || 'не вдалось'));
         }
       }
       total += posted;
@@ -3160,15 +2981,14 @@ async function runXTest({ account = '', chat = '', limit = 1, mode = 'auto', adm
         const newestTs = Math.max(...res.items.map(x => x.ts || snowTs(x.id) || 0));
         X.baseline[key] = newestTs > 0 ? newestTs : Date.now();
       }
-      lines.push('• <b>@' + esc(acc) + '</b>: ' + (posted ? '✅ взято ' + posted + ' із ' + videos.length : '❌ не вдалось') + ' → <code>' + esc(where) + '</code> (джерела: ' + esc(res.source) + ')');
+      lines.push('• <b>@' + esc(acc) + '</b>: ' + (posted ? '✅ надіслано ' + posted + ' із ' + videos.length : '❌ не вдалось') + ' → <code>' + esc(where) + '</code> (джерела: ' + esc(res.source) + ')');
     } catch (e) {
       lines.push('• <b>@' + esc(acc) + '</b>: ❌ ' + esc(redact(e.message).slice(0, 260)));
     }
   }
   Store.schedule();
   const srcLine = Object.entries(srcStats).map(([n, s]) => n + (s.consec ? ' ❌' : (s.ok ? ' ✅' : ' —'))).join(' · ');
-  const modeTitle = useHold ? ('у відложку на ' + (X.holdHours || 24) + ' год') : 'прямо в канали';
-  const text = (total ? '✅ <b>Тест X-Watcher завершено (' + modeTitle + ')</b>\n\n' : '⚠️ <b>Тест X-Watcher: нічого не надіслано</b>\n\n') + lines.join('\n') + '\n\n<i>Джерела: ' + srcLine + '</i>';
+  const text = (total ? '✅ <b>Тест X-Watcher завершено</b>\n\n' : '⚠️ <b>Тест X-Watcher: нічого не надіслано</b>\n\n') + lines.join('\n') + '\n\n<i>Джерела: ' + srcLine + '</i>';
   if (adminTok) await tg(adminTok, 'sendMessage', { chat_id: admin, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } }, { timeout: 15000, noRetry: true }).catch(e => log('xwatch', 'не вдалось надіслати підсумок тесту:', e.message));
   xr.test = { at: Date.now(), total, lines: lines.map(stripHtml) };
   return { total, lines };
@@ -3176,7 +2996,6 @@ async function runXTest({ account = '', chat = '', limit = 1, mode = 'auto', adm
 
 function xStatusJson() {
   const targets = allTargets();
-  const qList = Array.isArray(X.queue) ? X.queue : [];
   return {
     ok: true,
     enabled: X.enabled,
@@ -3188,17 +3007,7 @@ function xStatusJson() {
     creditText: X.credit,
     holdEnabled: !!X.holdEnabled,
     holdHours: Number(X.holdHours) || 24,
-    queueCount: qList.length,
-    queueItems: qList.slice(0, 25).map(q => ({
-      qid: q.qid,
-      account: q.account,
-      id: q.id,
-      text: String(q.text || '').slice(0, 120),
-      createdAt: q.createdAt,
-      publishAt: q.publishAt,
-      dupWarning: q.dupWarning || '',
-      targets: q.targets || targets
-    })),
+    scheduledDups: X.scheduledDups || 0,
     postedCount: X.posted,
     lastCheckAt: xr.lastTickAt,
     lastOkAt: xr.lastOkAt,
@@ -3272,7 +3081,7 @@ async function applyXConfig(b) {
     const t = String(b.botToken).trim();
     if (t !== S.token) { S.token = t; xr.botId = 0; changedTargets = true; }
   }
-  if (b.resetSeen) { S.seen = {}; S.baseline = {}; S.mediaSeen = []; xr.resolvedCache.clear(); }
+  if (b.resetSeen) { S.seen = {}; S.baseline = {}; S.mediaSeen = []; S.recentMeta = []; xr.resolvedCache.clear(); xr.scheduledMediaKeys.clear(); }
   if (b.reset) {
     S.accounts = uniq(parseList(env('X_ACCOUNTS', 'GoalsXtra,TheGoalsZone')).map(parseXUsername).filter(Boolean));
     S.targets = uniq(parseList(env('X_TARGET_CHAT', '@Fantasyargoal')).map(parseTelegramChat).filter(Boolean));
@@ -3469,10 +3278,6 @@ const server = http.createServer(async (req, res) => {
         if (body.adminChatId) runtime.adminChat = String(body.adminChatId);
         if (body.fallbackToken && !runtime.mainToken) runtime.mainToken = String(body.fallbackToken);
         await applyXConfig(body);
-        if (body.queueAction) {
-          const actionRes = await handleQueueAction(body);
-          return sendJson(res, 200, { ...xStatusJson(), actionResult: actionRes });
-        }
         if (body.diagNow) {
           runXDiag({ adminChat: body.adminChatId, fallbackToken: body.fallbackToken })
             .catch(e => log('xwatch', 'діагностика впала:', e.message));
@@ -3483,7 +3288,7 @@ const server = http.createServer(async (req, res) => {
             account: body.testAccount,
             chat: body.testChat,
             limit: body.limit || 1,
-            mode: body.testMode || 'auto',
+            mode: body.testMode || 'live',
             adminChat: body.adminChatId,
             fallbackToken: body.fallbackToken
           }).catch(e => log('xwatch', 'тест впав:', e.message));
