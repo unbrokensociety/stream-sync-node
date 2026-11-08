@@ -1666,7 +1666,7 @@ async function handleDiag(rawUrl, quality = 720) {
 
 // ==================== 13. X-ВОТЧЕР (відео-пости акаунтів → Telegram-канали, schedule_date для повторів) ====================
 const X = state.x;
-const X_INTERVAL_SEC = Math.max(envNum('X_MIN_INTERVAL_SEC', 5), envNum('X_INTERVAL_SEC', 8));
+const X_INTERVAL_SEC = Math.max(envNum('X_MIN_INTERVAL_SEC', 10), envNum('X_INTERVAL_SEC', 15));
 const X_MAX_AGE_MS = envNum('X_MAX_AGE_HOURS', 18) * 3600 * 1000;
 const FX_UA = 'TelegramBot (like TwitterBot)';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
